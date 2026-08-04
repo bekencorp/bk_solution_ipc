@@ -1,0 +1,21 @@
+# KCONFIG_GROUP: Solution & Product
+menu "Doorbell Service"
+    config APP_USE_ISP_MP_CHANNEL
+        depends on ISP
+        bool "app layer open isp mp channel default"
+        default y
+
+    config MDS_SNAPSHOT
+        bool "Enable snapshot capture module (JPEG HW/SW)"
+        default n
+        help
+            Build snapshot capture into multimedia_device_service.
+            Enable this option when snapshot CLI / doorbell capture is needed.
+
+    config MDS_CLI
+        bool "Enable multimedia device debug CLI"
+        default y
+        help
+            Build camera/display/GPU joint-test commands. Disable this for
+            headless products that do not need multimedia hardware test CLI.
+endmenu

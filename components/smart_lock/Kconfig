@@ -1,0 +1,8 @@
+menu "Smart Lock"
+
+    config SMART_LOCK
+        bool "Build the smart_lock component (legacy binary control-channel doorbell leaf)"
+        depends on INTEGRATION_DOORBELL && !SMART_INTERCOM
+        default y
+
+endmenu

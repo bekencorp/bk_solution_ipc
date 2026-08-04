@@ -1,0 +1,8 @@
+case名称,测试命令（必填）,输入设备（1代表设备1，2代表设备2以此类推，不填默认为设备1）,期望结果（选填）,超时时间(s)
+reboot,reboot,1,AP main running,120
+aov_sm_status,aov_sm status,1,state=,60
+aov_sm_gray_info,aov_sm gray_info,1,gray valid=,60
+aov_sm_invalid_event,aov_sm inject 999,1,ERROR,60
+aov_wifi_set,aov_wifi set debug_ap debug_password,1,OK,60
+aov_wifi_show,aov_wifi show,1,ssid=debug_ap password_len=14 valid=1,60
+aov_wifi_clear,aov_wifi clear,1,OK,60
