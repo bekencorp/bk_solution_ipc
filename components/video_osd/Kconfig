@@ -1,0 +1,7 @@
+menu "Video OSD"
+
+    config VIDEO_OSD
+        bool "Build video_osd (H264 encoder OSD time overlay)"
+        default n
+
+endmenu

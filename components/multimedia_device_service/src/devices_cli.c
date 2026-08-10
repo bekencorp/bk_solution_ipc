@@ -27,6 +27,9 @@
 #ifdef CONFIG_MDS_SNAPSHOT
 #include "bk_snapshot_sw.h"
 #endif
+#if CONFIG_VIDEO_OSD
+#include "video_osd.h"
+#endif
 #include <lcd/lcd_mipi_hx8399c_1080x1920.h>
 #include <lcd/lcd_mipi_hx8394f_720x1280.h>
 
@@ -1238,6 +1241,55 @@ static void cli_avdk_mds_h264_qp_cmd(char *pcWriteBuffer, int xWriteBufferLen, i
     LOGE("Usage: h264_qp get | set <bitrate> <i_min> <i_max> <p_min> <p_max>\n");
 }
 
+#if CONFIG_VIDEO_OSD
+static void cli_avdk_mds_osd_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char **argv)
+{
+    (void)pcWriteBuffer;
+    (void)xWriteBufferLen;
+
+    if (argc < 3 || argv[1] == NULL || argv[2] == NULL ||
+        os_strcmp(argv[1], "time") != 0) {
+        LOGE("Usage: osd time on [YYYY-MM-DD HH:MM:SS] | off\n");
+        return;
+    }
+
+    if (os_strcmp(argv[2], "off") == 0) {
+        video_osd_time_off();
+        LOGI("osd time off ok\n");
+        return;
+    }
+
+    if (os_strcmp(argv[2], "on") != 0) {
+        LOGE("Usage: osd time on [YYYY-MM-DD HH:MM:SS] | off\n");
+        return;
+    }
+
+    bk_h264_encode_ctlr_handle_t enc_handle = cli_mds_h264_get_handle();
+    if (enc_handle == NULL) {
+        LOGE("h264 encoder is not running\n");
+        return;
+    }
+
+    const char *datetime = NULL;
+    char buf[32];
+
+    if (argc >= 5 && argv[3] != NULL && argv[4] != NULL) {
+        os_snprintf(buf, sizeof(buf), "%s %s", argv[3], argv[4]);
+        datetime = buf;
+    }
+
+    avdk_err_t ret = video_osd_time_on(enc_handle, datetime);
+    if (ret != AVDK_ERR_OK) {
+        LOGE("osd time on failed, ret=%d\n", ret);
+        return;
+    }
+
+    LOGI("osd time on ok%s%s\n",
+         datetime ? ", seed=" : "",
+         datetime ? datetime : "");
+}
+#endif
+
 #if defined(CONFIG_INTEGRATION_DOORBELL) && defined(CONFIG_MDS_SNAPSHOT)
 #include "bk_snapshot.h"
 
@@ -1334,6 +1386,9 @@ static const struct cli_command s_devices_cli_commands[] =
     {"doorbell", "doorbell...", cli_avdk_mds_cmd},
     {"audio", "audio...", cli_avdk_mds_audio_cmd},
     {"h264_qp", "h264_qp get | set <bitrate> <i_min> <i_max> <p_min> <p_max>", cli_avdk_mds_h264_qp_cmd},
+#if CONFIG_VIDEO_OSD
+    {"osd", "osd time on [YYYY-MM-DD HH:MM:SS] | off", cli_avdk_mds_osd_cmd},
+#endif
 #if defined(CONFIG_INTEGRATION_DOORBELL) && defined(CONFIG_MDS_SNAPSHOT)
     {"snapshot", "snapshot capture [sw|hw] [save]", cli_avdk_mds_snapshot_cmd},
 #endif

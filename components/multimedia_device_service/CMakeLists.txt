@@ -1,6 +1,13 @@
 set(incs include)
 set(srcs .)
 set(priv_req bk_common)
+set(req)
+
+if (CONFIG_VIDEO_OSD)
+list(APPEND incs ${CMAKE_CURRENT_SOURCE_DIR}/../video_osd/include)
+list(APPEND req video_osd)
+list(APPEND priv_req video_osd)
+endif()
 
 list(APPEND srcs 
 	src/mds_img_manager.c
@@ -41,7 +48,7 @@ endif()
 
 list(APPEND priv_req unity include avdk_utils avdk_driver bk_peripheral bk_encoder media_service bk_network_transfer bk_frame_buffer)
 
-armino_component_register(SRCS "${srcs}" INCLUDE_DIRS "${incs}" PRIV_REQUIRES "${priv_req}")
+armino_component_register(SRCS "${srcs}" INCLUDE_DIRS "${incs}" REQUIRES "${req}" PRIV_REQUIRES "${priv_req}")
 
 add_definitions(-Wno-unused-variable
 				-Wno-unused-but-set-variable
