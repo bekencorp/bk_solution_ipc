@@ -60,12 +60,14 @@ static void app_gpu_frame_complete(void *frame, uint32_t frame_size, void *args)
 {
     (void)frame_size;
     (void)args;
+    #if CONFIG_BK_DISPLAY
     avdk_err_t ret = app_mipi_lcd_flush(frame, app_gpu_frame_free);
     if (ret != AVDK_ERR_OK)
     {
         LOGD("%s, %d, GPU failed to complete frame %p, %d\r\n", __func__, __LINE__, frame, ret);
         app_gpu_frame_free(frame);
     }
+    #endif
 }
 
 avdk_err_t app_gpu_turn_on(gpu_board_config_t *config)
