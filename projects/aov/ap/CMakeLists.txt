@@ -8,7 +8,7 @@ set(srcs
     aov_ap_cli.c
     state_machine/aov_ap_state_machine.c
     state_machine/aov_ap_motion.c
-    state_machine/aov_ap_record.c
+    state_machine/aov_ap_snapshot.c
     state_machine/aov_ap_qr_provision.c
     state_machine/aov_ap_wifi.c
 )
@@ -29,5 +29,6 @@ set(priv_req
     bk_wifi_driver
     bk_frame_buffer
     bk_peripheral
+    bk_encoder
 )
 armino_component_register(SRCS "${srcs}" INCLUDE_DIRS "${incs}" PRIV_REQUIRES "${priv_req}")

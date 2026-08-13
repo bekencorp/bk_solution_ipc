@@ -14,6 +14,7 @@ int aov_ap_motion_detect(void *user_data,
                          uint16_t width,
                          uint16_t height,
                          bool *motion);
+uint8_t *aov_ap_motion_get_sp_frame(void);
 int aov_ap_motion_stop(void *user_data);
 
 #ifdef __cplusplus

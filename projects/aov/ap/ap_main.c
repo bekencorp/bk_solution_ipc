@@ -20,7 +20,7 @@
 #include "doorbell_keepalive.h"
 #include "aov_ap_state_machine.h"
 #include "aov_ap_motion.h"
-#include "aov_ap_record.h"
+#include "aov_ap_snapshot.h"
 #include "aov_ap_qr_provision.h"
 #include "aov_ap_wifi.h"
 
@@ -28,7 +28,7 @@ extern void aov_ap_cli_init(void);
 
 static int aov_ap_stop_all(void *user_data)
 {
-    int ret = aov_ap_record_stop(user_data);
+    int ret = aov_ap_snapshot_stop(user_data);
     int motion_ret = aov_ap_motion_stop(user_data);
 
     return (ret != BK_OK) ? ret : motion_ret;
@@ -39,7 +39,7 @@ static const aov_ap_backend_ops_t s_aov_backend_ops = {
     .qr_provision_stop = aov_ap_qr_provision_stop,
     .capture_gray = aov_ap_motion_capture_gray,
     .motion_detect = aov_ap_motion_detect,
-    .capture_snapshot = aov_ap_record_capture_snapshot,
+    .capture_snapshot = aov_ap_snapshot_capture,
     .stop_all = aov_ap_stop_all,
 };
 

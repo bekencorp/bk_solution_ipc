@@ -280,7 +280,6 @@ static void aov_ap_run_motion_check(void)
     }
 
     aov_ap_set_state(AOV_AP_STATE_SNAPSHOT_CAPTURE);
-    #if 0
     if (s_ap_sm.ops.capture_snapshot) {
         ret = s_ap_sm.ops.capture_snapshot(s_ap_sm.ops.user_data);
         if (ret != BK_OK) {
@@ -288,7 +287,6 @@ static void aov_ap_run_motion_check(void)
             return;
         }
     }
-    #endif
 
     if (!motion) {
         aov_ap_send_report(AOV_AP_REPORT_NO_MOTION, BK_OK, NULL);
