@@ -20,28 +20,27 @@
 #include "doorbell_keepalive.h"
 #include "aov_ap_state_machine.h"
 #include "aov_ap_motion.h"
+#include "aov_ap_record.h"
+#include "aov_ap_qr_provision.h"
 #include "aov_ap_wifi.h"
 
-static int aov_qr_provision_start(void *user_data)
-{
-    (void)user_data;
-    /* Existing smart_lock boarding owns BLE provisioning. Camera QR backend
-     * will register a real implementation in the next integration slice. */
-    return BK_OK;
-}
+extern void aov_ap_cli_init(void);
 
-static int aov_qr_provision_stop(void *user_data)
+static int aov_ap_stop_all(void *user_data)
 {
-    (void)user_data;
-    return BK_OK;
+    int ret = aov_ap_record_stop(user_data);
+    int motion_ret = aov_ap_motion_stop(user_data);
+
+    return (ret != BK_OK) ? ret : motion_ret;
 }
 
 static const aov_ap_backend_ops_t s_aov_backend_ops = {
-    .qr_provision_start = aov_qr_provision_start,
-    .qr_provision_stop = aov_qr_provision_stop,
+    .qr_provision_start = aov_ap_qr_provision_start,
+    .qr_provision_stop = aov_ap_qr_provision_stop,
     .capture_gray = aov_ap_motion_capture_gray,
     .motion_detect = aov_ap_motion_detect,
-    .stop_all = aov_ap_motion_stop,
+    .capture_snapshot = aov_ap_record_capture_snapshot,
+    .stop_all = aov_ap_stop_all,
 };
 
 int main(void)
@@ -123,6 +122,7 @@ int main(void)
 #endif
 
     //doorbell_keepalive_cli_init();
+    aov_ap_cli_init();
     aov_ap_state_machine_start();
 
     return 0;

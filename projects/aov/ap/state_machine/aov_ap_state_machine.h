@@ -21,6 +21,8 @@ bk_err_t aov_ap_state_machine_start_motion_check(void);
 bk_err_t aov_ap_state_machine_notify_event_done(int result);
 bk_err_t aov_ap_state_machine_notify_live_stopped(int result);
 
+bk_err_t aov_ap_state_machine_test_complete_qr_provision(void);
+
 #ifdef __cplusplus
 }
 #endif

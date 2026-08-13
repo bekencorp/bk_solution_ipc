@@ -9,8 +9,8 @@ extern "C" {
 
 #define AOV_PROTOCOL_MAGIC                  (0x414F5653u) /* "AOVS" */
 #define AOV_PROTOCOL_VERSION                (2u)
-#define AOV_GRAY_WIDTH                      (240u)
-#define AOV_GRAY_HEIGHT                     (240u)
+#define AOV_GRAY_WIDTH                      (320u)
+#define AOV_GRAY_HEIGHT                     (180u)
 #define AOV_GRAY_STRIDE                     (AOV_GRAY_WIDTH)
 #define AOV_GRAY_BUFFER_SIZE                (AOV_GRAY_STRIDE * AOV_GRAY_HEIGHT)
 #define AOV_FIRST_MOTION_SAMPLE_INTERVAL_MS (1000u)
@@ -193,6 +193,7 @@ typedef struct {
     int (*capture_gray)(void *user_data, uint8_t *dst, uint32_t size);
     int (*motion_detect)(void *user_data, const uint8_t *previous, const uint8_t *current,
                          uint16_t width, uint16_t height, bool *motion);
+    int (*capture_snapshot)(void *user_data);
     int (*event_start)(void *user_data);
     int (*event_stop)(void *user_data);
     int (*live_start)(void *user_data);

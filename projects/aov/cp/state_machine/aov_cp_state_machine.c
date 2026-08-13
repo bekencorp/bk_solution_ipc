@@ -23,9 +23,10 @@
 #define AOV_CP_QUEUE_DEPTH              (16)
 #define AOV_CP_TASK_PRIORITY            (4)
 #define AOV_CP_TASK_STACK_SIZE          (4096)
-#define AOV_CP_DETECT_INTERVAL_MS       (1000)
+#define AOV_CP_DETECT_INTERVAL_MS       (3000u)
 #define AOV_CP_RETRY_INTERVAL_MS        (3000)
 #define AOV_CP_AP_STATE_TIMEOUT_MS      (5000)
+#define AOV_CP_AP_STATE_TIMEOUT_ENABLE  (0)
 
 typedef struct {
     bool initialized;
@@ -228,7 +229,9 @@ static bk_err_t aov_cp_start_ap_job(aov_ap_job_t job, aov_cp_state_t return_stat
     aov_cp_set_state(AOV_CP_STATE_AP_BOOTING, AOV_CP_EVENT_DETECT_TIMER);
     s_cp_sm.ap_vote_on = true;
     pl_wakeup_host(POWERUP_MULTIMEDIA_WAKEUP_HOST_FLAG);
-    aov_cp_arm_timer(AOV_CP_AP_STATE_TIMEOUT_MS, AOV_CP_EVENT_STATE_TIMEOUT);
+    if (AOV_CP_AP_STATE_TIMEOUT_ENABLE) {
+        aov_cp_arm_timer(AOV_CP_AP_STATE_TIMEOUT_MS, AOV_CP_EVENT_STATE_TIMEOUT);
+    }
     return BK_OK;
 }
 
@@ -331,8 +334,9 @@ static void aov_cp_handle_ap_report(const aov_ap_report_t *report)
                                  AOV_CP_EVENT_AP_REPORT);
             }
             if (s_cp_sm.active_job == AOV_AP_JOB_MOTION_CHECK) {
-                aov_cp_arm_timer(AOV_CP_AP_STATE_TIMEOUT_MS,
-                                 AOV_CP_EVENT_STATE_TIMEOUT);
+                if (AOV_CP_AP_STATE_TIMEOUT_ENABLE) {
+                    aov_cp_arm_timer(AOV_CP_AP_STATE_TIMEOUT_MS, AOV_CP_EVENT_STATE_TIMEOUT);
+                }
             } else if (s_cp_sm.active_job != AOV_AP_JOB_WIFI_CONNECT) {
                 aov_cp_cancel_timer();
             }
@@ -384,7 +388,7 @@ static void aov_cp_handle_ap_report(const aov_ap_report_t *report)
             break;
         case AOV_AP_REPORT_MOTION_DETECTED:
             s_cp_sm.aborting_job = true;
-            LOGI("motion detected; preserve previous gray baseline\n");
+            LOGI("motion detected; wait for AP powerdown\n");
             break;
         case AOV_AP_REPORT_EVENT_STARTED:
         case AOV_AP_REPORT_LIVE_STARTED:

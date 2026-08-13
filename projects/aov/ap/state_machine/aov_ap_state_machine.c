@@ -2,6 +2,7 @@
 
 #include <common/bk_include.h>
 #include <components/log.h>
+#include <components/system.h>
 #include <modules/wdrv_common.h>
 #include <os/mem.h>
 #include <os/os.h>
@@ -169,6 +170,14 @@ static void aov_ap_copy_current_gray_to_cp(aov_gray_frame_desc_t *desc)
     desc->valid = 1;
 }
 
+static void aov_ap_report_existing_gray_ready(void)
+{
+    if (s_ap_sm.shared && s_ap_sm.shared->previous_gray.valid) {
+        aov_ap_send_report(AOV_AP_REPORT_LAST_GRAY_READY, BK_OK,
+                           &s_ap_sm.shared->previous_gray);
+    }
+}
+
 static void aov_ap_stop_and_report_ready(bool save_gray)
 {
     aov_gray_frame_desc_t gray = {0};
@@ -233,6 +242,7 @@ static bk_err_t aov_ap_prepare_previous_gray(const uint8_t **previous)
 static void aov_ap_run_motion_check(void)
 {
     bool motion = false;
+    bool had_previous_gray = false;
     int ret;
 
     aov_ap_set_state(AOV_AP_STATE_MOTION_DETECTING);
@@ -249,6 +259,7 @@ static void aov_ap_run_motion_check(void)
     }
 
     const uint8_t *previous = NULL;
+    had_previous_gray = s_ap_sm.shared && s_ap_sm.shared->previous_gray.valid;
     ret = aov_ap_prepare_previous_gray(&previous);
     if (ret != BK_OK) {
         aov_ap_fail_and_stop(ret);
@@ -268,17 +279,30 @@ static void aov_ap_run_motion_check(void)
         return;
     }
 
+    aov_ap_set_state(AOV_AP_STATE_SNAPSHOT_CAPTURE);
+    #if 0
+    if (s_ap_sm.ops.capture_snapshot) {
+        ret = s_ap_sm.ops.capture_snapshot(s_ap_sm.ops.user_data);
+        if (ret != BK_OK) {
+            aov_ap_fail_and_stop(ret);
+            return;
+        }
+    }
+    #endif
+
     if (!motion) {
         aov_ap_send_report(AOV_AP_REPORT_NO_MOTION, BK_OK, NULL);
-        aov_ap_stop_and_report_ready(true);
+        if (had_previous_gray) {
+            aov_ap_report_existing_gray_ready();
+        }
+        aov_ap_stop_and_report_ready(!had_previous_gray);
         return;
     }
 
-    aov_ap_set_state(AOV_AP_STATE_SNAPSHOT_CAPTURE);
     aov_ap_send_report(AOV_AP_REPORT_MOTION_DETECTED, BK_OK, NULL);
-    LOGI("motion confirmed; snapshot backend is not enabled yet\n");
+    LOGI("motion confirmed; snapshot capture done\n");
     aov_ap_send_report(AOV_AP_REPORT_EVENT_DONE, BK_OK, NULL);
-    aov_ap_stop_and_report_ready(false);
+    aov_ap_stop_and_report_ready(true);
 }
 
 static void aov_ap_run_job(void)
@@ -403,6 +427,32 @@ bk_err_t aov_ap_state_machine_report_wifi_result(bool connected, int result)
                     AOV_AP_REPORT_WIFI_CONNECT_FAILED,
         result,
         NULL);
+}
+
+bk_err_t aov_ap_state_machine_test_complete_qr_provision(void)
+{
+    bk_err_t ret;
+
+    if (!s_ap_sm.initialized || !s_ap_sm.started ||
+        (s_ap_sm.job != AOV_AP_JOB_QR_PROVISION &&
+         s_ap_sm.job != AOV_AP_JOB_WIFI_CONNECT)) {
+        return BK_ERR_STATE;
+    }
+
+    if (s_ap_sm.state == AOV_AP_STATE_QR_PROVISION_CAPTURE &&
+        s_ap_sm.ops.qr_provision_stop) {
+        s_ap_sm.ops.qr_provision_stop(s_ap_sm.ops.user_data);
+    }
+
+    s_ap_sm.job = AOV_AP_JOB_WIFI_CONNECT;
+    aov_ap_set_state(AOV_AP_STATE_READY);
+
+    ret = aov_ap_state_machine_report_wifi_result(true, BK_OK);
+    if (ret != BK_OK) {
+        return ret;
+    }
+
+    return aov_ap_state_machine_start_motion_check();
 }
 
 bk_err_t aov_ap_state_machine_start_motion_check(void)

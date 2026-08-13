@@ -5,8 +5,11 @@ set(incs .
 
 set(srcs
     ap_main.c
+    aov_ap_cli.c
     state_machine/aov_ap_state_machine.c
     state_machine/aov_ap_motion.c
+    state_machine/aov_ap_record.c
+    state_machine/aov_ap_qr_provision.c
     state_machine/aov_ap_wifi.c
 )
 
@@ -16,6 +19,7 @@ if (CONFIG_AUD_PARAM_CTRL)
 endif()
 
 set(priv_req
+    bk_vfs
     multimedia_device_service
     avdk_utils
     media_service
