@@ -51,6 +51,8 @@ static camera_board_config_t *camera_board_config = NULL;
  * If true, we must use the safe instance-stop/destroy path to avoid MemFault.
  */
 static bool s_isp_camera_read_used = false;
+static uint32_t s_sensor_init_exposure = 0;
+static bool s_sensor_init_exposure_valid = false;
 
 static avdk_err_t app_isp_sensor_apply_mirror(bk_camera_sensor_handle_t handle, bool hmirror, bool vflip)
 {
@@ -120,12 +122,35 @@ bk_camera_sensor_handle_t app_isp_camera_sensor_handle_get(void)
     return isp_cam_handle.sensor_handle;
 }
 
+int app_isp_camera_set_sensor_init_exposure(uint32_t exposure)
+{
+    if (exposure == 0) {
+        return AVDK_ERR_INVAL;
+    }
+
+    s_sensor_init_exposure = exposure;
+    s_sensor_init_exposure_valid = true;
+    return BK_OK;
+}
+
+int app_isp_camera_query_exposure_info(
+    bk_isp_camera_exposure_info_t *info)
+{
+    if (info == NULL || isp_cam_handle.camera_ctlr_handle == NULL) {
+        return AVDK_ERR_INVAL;
+    }
+
+    return bk_isp_camera_ctlr_ioctl(
+        isp_cam_handle.camera_ctlr_handle,
+        BK_CAM_IOCTL_QUERY_EXPOSURE_INFO,
+        info);
+}
+
 int app_isp_camera_turn_off(void)
 {
     LOGI("%s\n", __func__);
 
     avdk_err_t ret = AVDK_ERR_OK;
-
     if (isp_cam_handle.camera_ctlr_handle == NULL && isp_cam_handle.isp_handle == NULL)
     {
         return AVDK_ERR_OK;
@@ -382,7 +407,29 @@ int app_isp_mipi_sensor_turn_on(const camera_board_config_t *config, bk_isp_came
     //step 2. sensor detect
     sensor_config.bus = bus;
     isp_cam_handle.sensor_handle = bk_camera_sensor_auto_detect(&sensor_config, CSI_CAMERA_PORT);
-    AVDK_GOTO_ON_FALSE(isp_cam_handle.sensor_handle, AVDK_ERR_NODEV, err, TAG, "sensor handle is NULL");
+    AVDK_GOTO_ON_FALSE(isp_cam_handle.sensor_handle, AVDK_ERR_NODEV, err, TAG, "sensor detect failed");
+
+    if (s_sensor_init_exposure_valid)
+    {
+        bk_camera_sensor_init_exposure_t init_config = {
+            .exposure = s_sensor_init_exposure,
+        };
+        int init_ret = bk_camera_sensor_ioctl(
+            isp_cam_handle.sensor_handle,
+            BK_CAMERA_SENSOR_IOCTL_SET_INIT_EXPOSURE,
+            &init_config);
+        if (init_ret == BK_OK)
+        {
+            LOGI("apply Sensor initExposure=%u\n",
+                 (unsigned)s_sensor_init_exposure);
+        }
+        else
+        {
+            LOGW("Sensor initExposure unsupported/failed: %d, use default\n",
+                 init_ret);
+        }
+        s_sensor_init_exposure_valid = false;
+    }
 
     bk_camera_sensor_format_array_t format_array = {0};
     AVDK_GOTO_ON_ERROR(bk_camera_sensor_query_support_formats(isp_cam_handle.sensor_handle, &format_array), err, TAG, "bk_camera_sensor_query_support_formats failed");

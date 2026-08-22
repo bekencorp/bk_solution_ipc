@@ -40,6 +40,9 @@ int app_isp_dvp_camera_turn_on(camera_parameters_ext_t *paramters);
 int app_isp_camera_sp_channel_turn_on(const camera_board_config_t *config);
 avdk_err_t app_isp_camera_sp_snapshot_channel_ensure(uint16_t width, uint16_t height);
 int app_isp_camera_channel_read(uint8_t channel ,uint8_t *frame, uint32_t size, uint32_t timeout);
+int app_isp_camera_set_sensor_init_exposure(uint32_t exposure);
+int app_isp_camera_query_exposure_info(
+    bk_isp_camera_exposure_info_t *info);
 
 int app_isp_dual_camera_turn_on(camera_parameters_ext_t *paramters);
 int app_isp_dual_camera_port_change();
