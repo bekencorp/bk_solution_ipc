@@ -10,12 +10,15 @@
 #include <os/os.h>
 
 #include "aov_state_protocol.h"
+#include "aov_debug.h"
 #include "app_camera.h"
 #include "app_gpu.h"
 #include "modules/motion_detect.h"
+#include "aov_ap_state_machine.h"
 
 #define TAG "aov_ap_motion"
 #define LOGI(...) BK_LOGI(TAG, ##__VA_ARGS__)
+#define LOGW(...) BK_LOGW(TAG, ##__VA_ARGS__)
 #define LOGE(...) BK_LOGE(TAG, ##__VA_ARGS__)
 
 #define AOV_MOTION_SP_WIDTH               (640u)
@@ -156,6 +159,18 @@ static int aov_ap_motion_camera_open(void)
     config->isp.sp_format = AOV_MOTION_FORMAT;
 
     if (app_isp_handle_get() == NULL) {
+        aov_ae_warm_start_t warm_start = {0};
+        if (aov_ap_state_machine_get_ae_warm_start(&warm_start) == BK_OK) {
+            int warm_ret = app_isp_camera_set_sensor_init_exposure(
+                warm_start.composite_exposure);
+            if (warm_ret == BK_OK) {
+                LOGI("prepare Sensor initExposure=%u\n",
+                     (unsigned)warm_start.composite_exposure);
+            } else {
+                LOGW("prepare Sensor initExposure failed: %d\n", warm_ret);
+            }
+        }
+
         int ret = app_isp_mipi_camera_sp_turn_on(config);
         if (ret != BK_OK) {
             LOGE("open SP-only MIPI camera failed: %d\n", ret);
@@ -184,20 +199,23 @@ int aov_ap_motion_capture_gray(void *user_data, uint8_t *dst, uint32_t size)
         return BK_ERR_PARAM;
     }
 
+    AOV_DEBUG_IO_UP(33);
     int ret = aov_ap_motion_camera_open();
     if (ret != BK_OK) {
+        AOV_DEBUG_IO_DOWN(33);
         return ret;
     }
 
     uint32_t frame_size = bk_image_size_get(AOV_MOTION_SP_WIDTH, AOV_MOTION_SP_HEIGHT,
                                              AOV_MOTION_FORMAT);
     if (frame_size == 0) {
+        AOV_DEBUG_IO_DOWN(33);
         return BK_ERR_PARAM;
     }
-
     if (s_motion_sp_frame == NULL) {
         s_motion_sp_frame = bk_frame_buffer_malloc(MEM_SLAB_HEAP_UNCODED, frame_size);
         if (s_motion_sp_frame == NULL) {
+            AOV_DEBUG_IO_DOWN(33);
             return BK_ERR_NO_MEM;
         }
     }
@@ -213,6 +231,7 @@ int aov_ap_motion_capture_gray(void *user_data, uint8_t *dst, uint32_t size)
                      (unsigned)(i + 1),
                      (unsigned)AOV_MOTION_WARMUP_READ_COUNT,
                      ret);
+                AOV_DEBUG_IO_DOWN(33);
                 return ret;
             }
         }
@@ -227,8 +246,10 @@ int aov_ap_motion_capture_gray(void *user_data, uint8_t *dst, uint32_t size)
     }
     if (ret == BK_OK) {
         ret = aov_ap_motion_blit_gray(s_motion_sp_frame, dst);
+        AOV_DEBUG_IO_DOWN(33);
     } else {
         LOGE("read ISP SP frame failed: %d\n", ret);
+        AOV_DEBUG_IO_DOWN(33);
     }
 
     return ret;
@@ -259,10 +280,12 @@ int aov_ap_motion_detect(void *user_data,
         .count_threshold = AOV_MOTION_COUNT_THRESHOLD,
     };
     motion_detect_result_t result = {0};
+    AOV_DEBUG_IO_UP(34);
     uint64_t start_us = bk_aon_rtc_get_us();
     int ret = motion_detect_compare_gray(&config, current, previous,
                                          s_motion_counts, &result);
     uint64_t cost_us = bk_aon_rtc_get_us() - start_us;
+    AOV_DEBUG_IO_DOWN(34);
     if (ret != MOTION_DETECT_OK) {
         LOGE("motion compare failed: %d cost=%llu us\n",
              ret, (unsigned long long)cost_us);
@@ -296,5 +319,35 @@ int aov_ap_motion_stop(void *user_data)
         return BK_OK;
     }
 
-    return app_isp_camera_turn_off();
+    bk_isp_camera_exposure_info_t info = {0};
+    int ae_ret = app_isp_camera_query_exposure_info(&info);
+    if (ae_ret == BK_OK && info.composite_exposure != 0) {
+        aov_ae_warm_start_t warm_start = {
+            .composite_exposure = info.composite_exposure,
+            .exposure_time_us = info.exposure_time_us,
+            .analog_gain = info.analog_gain,
+            .digital_gain = info.digital_gain,
+            .iso = info.iso,
+            .mean_luminance = info.mean_luminance,
+            .valid = 1,
+        };
+        int save_ret =
+            aov_ap_state_machine_save_ae_warm_start(&warm_start);
+        if (save_ret == BK_OK) {
+            LOGI("save AE warm-start: exposure=%u time=%u again=%u dgain=%u\n",
+                 (unsigned)info.composite_exposure,
+                 (unsigned)info.exposure_time_us,
+                 (unsigned)info.analog_gain,
+                 (unsigned)info.digital_gain);
+        } else {
+            LOGW("save AE warm-start failed: %d\n", save_ret);
+        }
+    } else {
+        LOGW("query AE warm-start failed: %d\n", ae_ret);
+    }
+
+    AOV_DEBUG_IO_UP(37);
+    int ret = app_isp_camera_turn_off();
+    AOV_DEBUG_IO_DOWN(37);
+    return ret;
 }

@@ -31,7 +31,6 @@ static const char *const s_ap_state_names[AOV_AP_STATE_MAX] = {
     [AOV_AP_STATE_BOOTING] = "BOOTING",
     [AOV_AP_STATE_READY] = "READY",
     [AOV_AP_STATE_QR_PROVISION_CAPTURE] = "QR_PROVISION_CAPTURE",
-    [AOV_AP_STATE_SNAPSHOT_CAPTURE] = "SNAPSHOT_CAPTURE",
     [AOV_AP_STATE_MOTION_DETECTING] = "MOTION_DETECTING",
     [AOV_AP_STATE_EVENT_ACTIVE] = "EVENT_ACTIVE",
     [AOV_AP_STATE_LIVE_STREAMING] = "LIVE_STREAMING",
@@ -139,6 +138,28 @@ static bk_err_t aov_ap_query_shared_env(void)
         s_ap_sm.job = AOV_AP_JOB_NONE;
         return BK_FAIL;
     }
+
+    if (s_ap_sm.shared->previous_gray.valid) {
+        LOGI("AP boot found saved gray: frame=%u timestamp=%u crc=0x%x addr=0x%x\n",
+             (unsigned)s_ap_sm.shared->previous_gray.frame_id,
+             (unsigned)s_ap_sm.shared->previous_gray.timestamp_ms,
+             (unsigned)s_ap_sm.shared->previous_gray.crc32,
+             (unsigned)s_ap_sm.shared->previous_gray.buffer_addr);
+    } else {
+        LOGI("AP boot has no saved gray; create baseline from current session\n");
+    }
+
+    if (s_ap_sm.shared->previous_ae.valid) {
+        const aov_ae_warm_start_t *ae = &s_ap_sm.shared->previous_ae;
+        LOGI("AP boot found AE warm-start: exposure=%u time=%u again=%u dgain=%u\n",
+             (unsigned)ae->composite_exposure,
+             (unsigned)ae->exposure_time_us,
+             (unsigned)ae->analog_gain,
+             (unsigned)ae->digital_gain);
+    } else {
+        LOGI("AP boot has no AE warm-start; use Sensor default\n");
+    }
+
     return BK_OK;
 }
 
@@ -170,28 +191,26 @@ static void aov_ap_copy_current_gray_to_cp(aov_gray_frame_desc_t *desc)
     desc->valid = 1;
 }
 
-static void aov_ap_report_existing_gray_ready(void)
-{
-    if (s_ap_sm.shared && s_ap_sm.shared->previous_gray.valid) {
-        aov_ap_send_report(AOV_AP_REPORT_LAST_GRAY_READY, BK_OK,
-                           &s_ap_sm.shared->previous_gray);
-    }
-}
-
 static void aov_ap_stop_and_report_ready(bool save_gray)
 {
     aov_gray_frame_desc_t gray = {0};
+
+    /*
+     * Preserve the final gray frame before stopping the camera pipeline.
+     * Report it after stop completes so CP still gates power-off on a fully
+     * quiesced AP.
+     */
+    if (save_gray) {
+        aov_ap_copy_current_gray_to_cp(&gray);
+    }
 
     aov_ap_set_state(AOV_AP_STATE_STOPPING);
     if (s_ap_sm.ops.stop_all) {
         s_ap_sm.ops.stop_all(s_ap_sm.ops.user_data);
     }
 
-    if (save_gray) {
-        aov_ap_copy_current_gray_to_cp(&gray);
-        if (gray.valid) {
-            aov_ap_send_report(AOV_AP_REPORT_LAST_GRAY_READY, BK_OK, &gray);
-        }
+    if (gray.valid) {
+        aov_ap_send_report(AOV_AP_REPORT_LAST_GRAY_READY, BK_OK, &gray);
     }
 
     aov_ap_set_state(AOV_AP_STATE_POWERDOWN_READY);
@@ -205,15 +224,18 @@ static void aov_ap_fail_and_stop(int result)
     aov_ap_stop_and_report_ready(false);
 }
 
-static bk_err_t aov_ap_prepare_previous_gray(const uint8_t **previous)
+static bk_err_t aov_ap_prepare_previous_gray(uint8_t **previous)
 {
     if (previous == NULL || s_ap_sm.shared == NULL) {
         return BK_ERR_STATE;
     }
 
     if (s_ap_sm.shared->previous_gray.valid) {
-        *previous = (const uint8_t *)(uintptr_t)
+        *previous = (uint8_t *)(uintptr_t)
             s_ap_sm.shared->previous_gray.buffer_addr;
+        LOGI("use saved gray for first comparison: frame=%u crc=0x%x\n",
+             (unsigned)s_ap_sm.shared->previous_gray.frame_id,
+             (unsigned)s_ap_sm.shared->previous_gray.crc32);
         return (*previous != NULL) ? BK_OK : BK_ERR_STATE;
     }
 
@@ -242,7 +264,10 @@ static bk_err_t aov_ap_prepare_previous_gray(const uint8_t **previous)
 static void aov_ap_run_motion_check(void)
 {
     bool motion = false;
-    bool had_previous_gray = false;
+    bool motion_seen = false;
+    bool has_saved_previous = false;
+    uint32_t consecutive_no_motion = 0;
+    uint32_t comparison_count = 0;
     int ret;
 
     aov_ap_set_state(AOV_AP_STATE_MOTION_DETECTING);
@@ -250,6 +275,7 @@ static void aov_ap_run_motion_check(void)
         aov_ap_fail_and_stop(BK_ERR_NOT_SUPPORT);
         return;
     }
+
     ret = s_ap_sm.ops.capture_gray(s_ap_sm.ops.user_data,
                                    s_current_gray,
                                    sizeof(s_current_gray));
@@ -258,8 +284,9 @@ static void aov_ap_run_motion_check(void)
         return;
     }
 
-    const uint8_t *previous = NULL;
-    had_previous_gray = s_ap_sm.shared && s_ap_sm.shared->previous_gray.valid;
+    uint8_t *previous = NULL;
+    has_saved_previous =
+        s_ap_sm.shared && s_ap_sm.shared->previous_gray.valid;
     ret = aov_ap_prepare_previous_gray(&previous);
     if (ret != BK_OK) {
         aov_ap_fail_and_stop(ret);
@@ -270,37 +297,66 @@ static void aov_ap_run_motion_check(void)
         aov_ap_fail_and_stop(BK_ERR_NOT_SUPPORT);
         return;
     }
-    ret = s_ap_sm.ops.motion_detect(s_ap_sm.ops.user_data,
-                                    previous, s_current_gray,
-                                    AOV_GRAY_WIDTH, AOV_GRAY_HEIGHT,
-                                    &motion);
-    if (ret != BK_OK) {
-        aov_ap_fail_and_stop(ret);
-        return;
-    }
+    while (true) {
+        ret = s_ap_sm.ops.motion_detect(s_ap_sm.ops.user_data,
+                                        previous, s_current_gray,
+                                        AOV_GRAY_WIDTH, AOV_GRAY_HEIGHT,
+                                        &motion);
+        if (ret != BK_OK) {
+            aov_ap_fail_and_stop(ret);
+            return;
+        }
+        comparison_count++;
+        LOGI("motion comparison[%u] source=%s result=%u\n",
+             (unsigned)comparison_count,
+             (comparison_count == 1 && has_saved_previous) ?
+                 "saved_previous" : "current_session",
+             (unsigned)motion);
 
-    aov_ap_set_state(AOV_AP_STATE_SNAPSHOT_CAPTURE);
-    if (s_ap_sm.ops.capture_snapshot) {
-        ret = s_ap_sm.ops.capture_snapshot(s_ap_sm.ops.user_data);
+        if (motion) {
+            consecutive_no_motion = 0;
+            if (!motion_seen) {
+                motion_seen = true;
+                aov_ap_send_report(AOV_AP_REPORT_MOTION_DETECTED, BK_OK, NULL);
+            }
+            LOGI("motion continues; keep camera running\n");
+        } else {
+            if (!motion_seen) {
+                /*
+                 * Initial check found no motion: finish this AOV job
+                 * immediately. The 30-frame confirmation only applies after
+                 * motion has been observed during this job.
+                 */
+                LOGI("initial check has no motion; stop camera\n");
+                break;
+            }
+
+            consecutive_no_motion++;
+            LOGI("motion ended candidate: no motion count=%u/%u\n",
+                 (unsigned)consecutive_no_motion,
+                 (unsigned)AOV_CONSECUTIVE_NO_MOTION_STOP_COUNT);
+            if (consecutive_no_motion >=
+                AOV_CONSECUTIVE_NO_MOTION_STOP_COUNT) {
+                break;
+            }
+        }
+
+        /* Current frame becomes the reference for the next frame. */
+        os_memcpy(previous, s_current_gray, AOV_GRAY_BUFFER_SIZE);
+        ret = s_ap_sm.ops.capture_gray(s_ap_sm.ops.user_data,
+                                       s_current_gray,
+                                       sizeof(s_current_gray));
         if (ret != BK_OK) {
             aov_ap_fail_and_stop(ret);
             return;
         }
     }
 
-    if (!motion) {
-        aov_ap_send_report(AOV_AP_REPORT_NO_MOTION, BK_OK, NULL);
-        if (had_previous_gray) {
-            aov_ap_report_existing_gray_ready();
-        }
-        aov_ap_stop_and_report_ready(!had_previous_gray);
-        return;
-    }
-
-    aov_ap_send_report(AOV_AP_REPORT_MOTION_DETECTED, BK_OK, NULL);
-    LOGI("motion confirmed; snapshot capture done\n");
-    aov_ap_send_report(AOV_AP_REPORT_EVENT_DONE, BK_OK, NULL);
+    LOGI("motion idle threshold reached; close camera before notifying CP\n");
     aov_ap_stop_and_report_ready(true);
+    aov_ap_send_report(motion_seen ? AOV_AP_REPORT_EVENT_DONE :
+                                     AOV_AP_REPORT_NO_MOTION,
+                       BK_OK, NULL);
 }
 
 static void aov_ap_run_job(void)
@@ -402,6 +458,36 @@ aov_ap_job_t aov_ap_state_machine_get_pending_job(void)
 aov_ap_state_t aov_ap_state_machine_get_state(void)
 {
     return s_ap_sm.state;
+}
+
+bk_err_t aov_ap_state_machine_get_ae_warm_start(
+    aov_ae_warm_start_t *info)
+{
+    if (info == NULL || s_ap_sm.shared == NULL) {
+        return BK_ERR_PARAM;
+    }
+    if (!s_ap_sm.shared->previous_ae.valid) {
+        return BK_ERR_NOT_FOUND;
+    }
+
+    *info = s_ap_sm.shared->previous_ae;
+    return BK_OK;
+}
+
+bk_err_t aov_ap_state_machine_save_ae_warm_start(
+    const aov_ae_warm_start_t *info)
+{
+    if (info == NULL || s_ap_sm.shared == NULL ||
+        info->composite_exposure == 0) {
+        return BK_ERR_PARAM;
+    }
+
+    aov_ae_warm_start_t copy = *info;
+    copy.valid = 0;
+    s_ap_sm.shared->previous_ae.valid = 0;
+    s_ap_sm.shared->previous_ae = copy;
+    s_ap_sm.shared->previous_ae.valid = 1;
+    return BK_OK;
 }
 
 bk_err_t aov_ap_state_machine_report_qr_credential(const void *data, uint16_t len)

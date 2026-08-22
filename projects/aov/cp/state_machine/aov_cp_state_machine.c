@@ -11,6 +11,7 @@
 #include <stdlib.h>
 
 #include "bk_pm_internal_api.h"
+#include "aov_debug.h"
 #include "cli.h"
 #include "powerctrl.h"
 
@@ -23,19 +24,23 @@
 #define AOV_CP_QUEUE_DEPTH              (16)
 #define AOV_CP_TASK_PRIORITY            (4)
 #define AOV_CP_TASK_STACK_SIZE          (4096)
-#define AOV_CP_DETECT_INTERVAL_MS       (3000u)
 #define AOV_CP_RETRY_INTERVAL_MS        (3000)
+/* Legacy watchdog arming only; timeout must NOT force-close AP. */
 #define AOV_CP_AP_STATE_TIMEOUT_MS      (5000)
 #define AOV_CP_AP_STATE_TIMEOUT_ENABLE  (0)
+#define AOV_CP_DETECT_ALARM_NAME        "aov_det"
+#define AOV_CP_ONESHOT_ALARM_NAME       "aov_sm"
 
 typedef struct {
     bool initialized;
     bool running;
     bool ap_vote_on;
+    bool ap_powering_down;
     bool work_complete;
     bool last_gray_ready;
     bool powerdown_ready;
     bool aborting_job;
+    bool detect_armed;
     volatile bool rtc_sleep_voted;
     uint32_t retry_count;
     uint32_t active_sequence;
@@ -44,16 +49,24 @@ typedef struct {
     aov_cp_state_t return_state;
     beken_queue_t queue;
     beken_thread_t thread;
-    alarm_info_t alarm;
-    aov_cp_event_id_t timer_event;
+    alarm_info_t oneshot_alarm;
+    alarm_info_t detect_alarm;
+    aov_cp_event_id_t oneshot_event;
     aov_cp_device_ops_t ops;
 } aov_cp_sm_env_t;
 
 static aov_cp_sm_env_t s_cp_sm;
 static _Alignas(64) aov_shared_env_t s_shared_env;
+/* Drop RTC catch-up multi-callbacks / duplicate queue events within one period. */
+static uint32_t s_detect_last_evt_ms;
 
 static bk_err_t aov_cp_arm_timer(uint32_t interval_ms,
                                  aov_cp_event_id_t event_id);
+static bk_err_t aov_cp_cancel_oneshot_timer(void);
+static bk_err_t aov_cp_cancel_detect_rtc(void);
+static void aov_cp_unvote_rtc_sleep(void);
+static bk_err_t aov_cp_vote_rtc_sleep(void);
+static void aov_cp_ap_power_off_callback(void *arg);
 
 static const char *const s_cp_state_names[AOV_CP_STATE_MAX] = {
     [AOV_CP_STATE_BOOT_INIT] = "BOOT_INIT",
@@ -101,89 +114,172 @@ static void aov_cp_set_state(aov_cp_state_t next, aov_cp_event_id_t event)
     }
 }
 
-static void aov_cp_timer_callback(aon_rtc_id_t id, uint8_t *name_p, void *param)
-{
-    aov_cp_event_t event = {0};
-
-    (void)id;
-    (void)name_p;
-    (void)param;
-
-    if (!s_cp_sm.running) {
-        return;
-    }
-
-    if (s_cp_sm.timer_event == AOV_CP_EVENT_DETECT_TIMER &&
-        s_cp_sm.rtc_sleep_voted) {
-        bk_pm_module_vote_sleep_ctrl(PM_SLEEP_MODULE_NAME_APP, 0x0, 0x0);
-        s_cp_sm.rtc_sleep_voted = false;
-    }
-
-    event.id = s_cp_sm.timer_event;
-    if (rtos_push_to_queue(&s_cp_sm.queue, &event, BEKEN_NO_WAIT) != BK_OK) {
-        LOGE("timer event queue full, event=%u\n", (unsigned)event.id);
-    }
-}
-
-static bk_err_t aov_cp_cancel_timer(void)
+static void aov_cp_unvote_rtc_sleep(void)
 {
     if (s_cp_sm.rtc_sleep_voted) {
         bk_pm_module_vote_sleep_ctrl(PM_SLEEP_MODULE_NAME_APP, 0x0, 0x0);
         s_cp_sm.rtc_sleep_voted = false;
     }
-
-    if (s_cp_sm.alarm.name[0] == '\0') {
-        return BK_OK;
-    }
-
-    bk_alarm_unregister(AON_RTC_ID_1, s_cp_sm.alarm.name);
-    os_memset(&s_cp_sm.alarm, 0, sizeof(s_cp_sm.alarm));
-    return BK_OK;
 }
 
-static bk_err_t aov_cp_arm_detect_rtc(void)
+static bk_err_t aov_cp_vote_rtc_sleep(void)
 {
-    bk_err_t ret = aov_cp_arm_timer(AOV_CP_DETECT_INTERVAL_MS,
-                                    AOV_CP_EVENT_DETECT_TIMER);
-    if (ret != BK_OK) {
-        return ret;
+    bk_err_t ret;
+
+    if (s_cp_sm.rtc_sleep_voted) {
+        return BK_OK;
     }
 
     bk_pm_sleep_mode_set(PM_MODE_LOW_VOLTAGE);
     ret = bk_pm_module_vote_sleep_ctrl(PM_SLEEP_MODULE_NAME_APP, 0x1, 0x0);
     if (ret != BK_OK) {
         LOGE("RTC sleep vote failed: %d\n", ret);
-        aov_cp_cancel_timer();
         return ret;
     }
 
     s_cp_sm.rtc_sleep_voted = true;
-    LOGI("RTC motion wake armed: %u ms\n", AOV_CP_DETECT_INTERVAL_MS);
+    return BK_OK;
+}
+
+static void aov_cp_timer_callback(aon_rtc_id_t id, uint8_t *name_p, void *param)
+{
+    aov_cp_event_t event = {0};
+    bool is_detect;
+
+    (void)param;
+
+    if (!s_cp_sm.running) {
+        return;
+    }
+
+    is_detect = (name_p != NULL &&
+                 os_strcmp((const char *)name_p, AOV_CP_DETECT_ALARM_NAME) == 0);
+    if (is_detect) {
+        /* Do not toggle GPIO here: AP JPEG may share GPIO30-39. Mark in task. */
+        aov_cp_unvote_rtc_sleep();
+        event.id = AOV_CP_EVENT_DETECT_TIMER;
+    } else {
+        event.id = s_cp_sm.oneshot_event;
+    }
+
+    (void)id;
+
+    if (rtos_push_to_queue(&s_cp_sm.queue, &event, BEKEN_NO_WAIT) != BK_OK) {
+        LOGE("timer event queue full, event=%u\n", (unsigned)event.id);
+    }
+}
+
+static void aov_cp_ap_power_off_callback(void *arg)
+{
+    aov_cp_event_t event = {.id = AOV_CP_EVENT_AP_POWERED_OFF};
+
+    (void)arg;
+    if (!s_cp_sm.running || !s_cp_sm.ap_powering_down) {
+        return;
+    }
+
+    if (rtos_push_to_queue(&s_cp_sm.queue, &event, BEKEN_NO_WAIT) != BK_OK) {
+        LOGE("AP power-off event queue full\n");
+    }
+}
+
+static bk_err_t aov_cp_cancel_oneshot_timer(void)
+{
+    if (s_cp_sm.oneshot_alarm.name[0] == '\0') {
+        return BK_OK;
+    }
+
+    bk_alarm_unregister(AON_RTC_ID_1, s_cp_sm.oneshot_alarm.name);
+    os_memset(&s_cp_sm.oneshot_alarm, 0, sizeof(s_cp_sm.oneshot_alarm));
+    return BK_OK;
+}
+
+static bk_err_t aov_cp_cancel_detect_rtc(void)
+{
+    aov_cp_unvote_rtc_sleep();
+
+    if (!s_cp_sm.detect_armed && s_cp_sm.detect_alarm.name[0] == '\0') {
+        return BK_OK;
+    }
+
+    if (s_cp_sm.detect_alarm.name[0] != '\0') {
+        bk_alarm_unregister(AON_RTC_ID_1, s_cp_sm.detect_alarm.name);
+    }
+    os_memset(&s_cp_sm.detect_alarm, 0, sizeof(s_cp_sm.detect_alarm));
+    s_cp_sm.detect_armed = false;
+    s_detect_last_evt_ms = 0;
+    return BK_OK;
+}
+
+static bk_err_t aov_cp_cancel_timer(void)
+{
+    (void)aov_cp_cancel_oneshot_timer();
+    return aov_cp_cancel_detect_rtc();
+}
+
+static bk_err_t aov_cp_arm_detect_rtc(void)
+{
+    bk_err_t ret;
+    alarm_info_t alarm = {0};
+
+    /*
+     * Keep one free-running RTC phase. AP jobs must not cancel or re-register
+     * it; otherwise the observed period becomes interval + AP work time.
+     */
+    if (s_cp_sm.detect_armed) {
+        return aov_cp_vote_rtc_sleep();
+    }
+
+    os_strncpy((char *)alarm.name, AOV_CP_DETECT_ALARM_NAME, sizeof(alarm.name) - 1);
+    alarm.period_tick = AOV_CP_DETECT_INTERVAL_MS * AON_RTC_MS_TICK_CNT;
+    alarm.period_cnt = ALARM_LOOP_FOREVER;
+    alarm.callback = aov_cp_timer_callback;
+
+    os_memcpy(&s_cp_sm.detect_alarm, &alarm, sizeof(alarm));
+    ret = bk_alarm_register(AON_RTC_ID_1, &s_cp_sm.detect_alarm);
+    if (ret != BK_OK) {
+        LOGE("arm detect rtc failed: %d\n", ret);
+        os_memset(&s_cp_sm.detect_alarm, 0, sizeof(s_cp_sm.detect_alarm));
+        return ret;
+    }
+
+    s_cp_sm.detect_armed = true;
+    bk_pm_wakeup_source_set(PM_WAKEUP_SOURCE_INT_RTC, NULL);
+    ret = aov_cp_vote_rtc_sleep();
+    if (ret != BK_OK) {
+        aov_cp_cancel_detect_rtc();
+        return ret;
+    }
+
+    LOGI("RTC motion detect armed: %u ms periodic\n",
+         AOV_CP_DETECT_INTERVAL_MS);
     return BK_OK;
 }
 
 static bk_err_t aov_cp_arm_timer(uint32_t interval_ms, aov_cp_event_id_t event_id)
 {
     alarm_info_t alarm = {0};
-    os_strncpy((char *)alarm.name, "aov_sm", sizeof(alarm.name) - 1);
+    os_strncpy((char *)alarm.name, AOV_CP_ONESHOT_ALARM_NAME, sizeof(alarm.name) - 1);
     alarm.period_tick = interval_ms * AON_RTC_MS_TICK_CNT;
     alarm.period_cnt = 1;
     alarm.callback = aov_cp_timer_callback;
 
-    aov_cp_cancel_timer();
-    s_cp_sm.timer_event = event_id;
-    os_memcpy(&s_cp_sm.alarm, &alarm, sizeof(alarm));
+    /* Do not touch the free-running detect alarm. */
+    aov_cp_cancel_oneshot_timer();
+    s_cp_sm.oneshot_event = event_id;
+    os_memcpy(&s_cp_sm.oneshot_alarm, &alarm, sizeof(alarm));
 
-    bk_err_t ret = bk_alarm_register(AON_RTC_ID_1, &s_cp_sm.alarm);
+    bk_err_t ret = bk_alarm_register(AON_RTC_ID_1, &s_cp_sm.oneshot_alarm);
     if (ret != BK_OK) {
         LOGE("arm timer failed: %d, interval=%u, event=%u\n",
              ret, (unsigned)interval_ms, (unsigned)event_id);
-        os_memset(&s_cp_sm.alarm, 0, sizeof(s_cp_sm.alarm));
+        os_memset(&s_cp_sm.oneshot_alarm, 0, sizeof(s_cp_sm.oneshot_alarm));
         return ret;
     }
 
     bk_pm_wakeup_source_set(PM_WAKEUP_SOURCE_INT_RTC, NULL);
-    LOGD("timer armed: %u ms, event=%u\n", (unsigned)interval_ms, (unsigned)event_id);
+    LOGD("oneshot timer armed: %u ms, event=%u\n",
+         (unsigned)interval_ms, (unsigned)event_id);
     return BK_OK;
 }
 
@@ -207,7 +303,9 @@ static bk_err_t aov_cp_start_ap_job(aov_ap_job_t job, aov_cp_state_t return_stat
         return BK_ERR_BUSY;
     }
 
-    aov_cp_cancel_timer();
+    /* Keep the periodic detect RTC running; ticks only warn while AP is up. */
+    aov_cp_cancel_oneshot_timer();
+    aov_cp_unvote_rtc_sleep();
     aov_cp_reset_job_flags();
     s_cp_sm.active_sequence++;
     s_cp_sm.active_job = job;
@@ -219,6 +317,7 @@ static bk_err_t aov_cp_start_ap_job(aov_ap_job_t job, aov_cp_state_t return_stat
     s_shared_env.sequence = s_cp_sm.active_sequence;
     s_shared_env.pending_job = job;
     s_shared_env.ap_state = AOV_AP_STATE_OFF;
+    /* Keep previous_gray.valid/data; only refresh buffer descriptor fields. */
     s_shared_env.previous_gray.buffer_addr =
         (uint32_t)(uintptr_t)&s_shared_env.previous_gray_data[0];
     s_shared_env.previous_gray.data_length = AOV_GRAY_BUFFER_SIZE;
@@ -242,23 +341,28 @@ static bool aov_cp_job_requires_gray(void)
 
 static void aov_cp_finish_ap_powerdown(aov_cp_event_id_t event_id)
 {
-    bool rearm_motion_rtc =
-        s_cp_sm.active_job == AOV_AP_JOB_MOTION_CHECK;
-
-    aov_cp_cancel_timer();
-    if (s_cp_sm.ap_vote_on) {
-        pl_power_down_host();
-        s_cp_sm.ap_vote_on = false;
+    aov_cp_cancel_oneshot_timer();
+    if (!s_cp_sm.ap_vote_on || s_cp_sm.ap_powering_down) {
+        return;
     }
 
+    s_cp_sm.ap_powering_down = true;
+    aov_cp_set_state(AOV_CP_STATE_AP_POWERDOWN, event_id);
+    pl_power_down_host();
+}
+
+static void aov_cp_complete_ap_powerdown(aov_cp_event_id_t event_id)
+{
+    s_cp_sm.ap_powering_down = false;
+    s_cp_sm.ap_vote_on = false;
     s_shared_env.pending_job = AOV_AP_JOB_NONE;
     s_shared_env.ap_state = AOV_AP_STATE_OFF;
     s_cp_sm.active_job = AOV_AP_JOB_NONE;
 
     aov_cp_set_state(s_cp_sm.return_state, event_id);
-    if (rearm_motion_rtc &&
-        (s_cp_sm.return_state == AOV_CP_STATE_KEEPALIVE ||
-         s_cp_sm.return_state == AOV_CP_STATE_CLOUD_REGISTERING)) {
+    if (s_cp_sm.return_state == AOV_CP_STATE_KEEPALIVE ||
+        s_cp_sm.return_state == AOV_CP_STATE_CLOUD_REGISTERING) {
+        /* Alarm is already periodic; this only restores the LV sleep vote. */
         aov_cp_arm_detect_rtc();
     }
 }
@@ -324,7 +428,7 @@ static void aov_cp_handle_ap_report(const aov_ap_report_t *report)
             if (s_cp_sm.active_job == AOV_AP_JOB_WIFI_CONNECT) {
                 aov_cp_set_state(AOV_CP_STATE_WIFI_CONNECTING,
                                  AOV_CP_EVENT_AP_REPORT);
-                aov_cp_cancel_timer();
+                aov_cp_cancel_oneshot_timer();
                 int ret = aov_cp_call_start_wifi();
                 if (ret != BK_OK) {
                     aov_cp_enter_retry(AOV_CP_EVENT_WIFI_CONNECT_FAIL, ret);
@@ -338,7 +442,7 @@ static void aov_cp_handle_ap_report(const aov_ap_report_t *report)
                     aov_cp_arm_timer(AOV_CP_AP_STATE_TIMEOUT_MS, AOV_CP_EVENT_STATE_TIMEOUT);
                 }
             } else if (s_cp_sm.active_job != AOV_AP_JOB_WIFI_CONNECT) {
-                aov_cp_cancel_timer();
+                aov_cp_cancel_oneshot_timer();
             }
             break;
         case AOV_AP_REPORT_WIFI_CONNECTED: {
@@ -397,10 +501,9 @@ static void aov_cp_handle_ap_report(const aov_ap_report_t *report)
                  (unsigned)report->report_id, report->result);
             break;
         case AOV_AP_REPORT_ERROR:
-            LOGE("AP error: %d\n", report->result);
+            LOGE("AP error: %d; wait for POWERDOWN_READY\n", report->result);
             s_cp_sm.aborting_job = true;
             s_cp_sm.work_complete = true;
-            aov_cp_set_state(AOV_CP_STATE_AP_POWERDOWN, AOV_CP_EVENT_AP_REPORT);
             aov_cp_try_powerdown(AOV_CP_EVENT_AP_REPORT);
             break;
         default:
@@ -525,10 +628,36 @@ static void aov_cp_handle_event(const aov_cp_event_t *event)
             break;
         }
         case AOV_CP_EVENT_DETECT_TIMER:
+            /*
+             * Strict periodic tick: wake AP when down; if already awake, only
+             * warn. Never cancel/re-arm here, so the next tick remains aligned.
+             */
+            {
+                uint32_t now_ms = rtos_get_time();
+                uint32_t min_gap_ms = (AOV_CP_DETECT_INTERVAL_MS * 4u) / 5u;
+
+                if (s_detect_last_evt_ms != 0 &&
+                    (now_ms - s_detect_last_evt_ms) < min_gap_ms) {
+                    break;
+                }
+                s_detect_last_evt_ms = now_ms;
+                AOV_DEBUG_IO_UP(AOV_CP_DETECT_DBG_GPIO);
+                AOV_DEBUG_IO_DOWN(AOV_CP_DETECT_DBG_GPIO);
+            }
+
+            if (s_cp_sm.ap_vote_on) {
+                LOGW("detect tick: AP already awake (state=%s job=%u), skip wake\n",
+                     aov_cp_state_name(s_cp_sm.state),
+                     (unsigned)s_cp_sm.active_job);
+                break;
+            }
             if (s_cp_sm.state == AOV_CP_STATE_KEEPALIVE ||
                 s_cp_sm.state == AOV_CP_STATE_CLOUD_REGISTERING) {
                 aov_cp_start_ap_job(AOV_AP_JOB_MOTION_CHECK,
                                     s_cp_sm.state);
+            } else {
+                /* AP remains down; allow LV sleep until the next fixed tick. */
+                (void)aov_cp_vote_rtc_sleep();
             }
             break;
         case AOV_CP_EVENT_LIVE_START:
@@ -538,13 +667,14 @@ static void aov_cp_handle_event(const aov_cp_event_t *event)
             }
             break;
         case AOV_CP_EVENT_STATE_TIMEOUT:
-            LOGE("state timeout in %s\n", aov_cp_state_name(s_cp_sm.state));
-            if (s_cp_sm.ap_vote_on) {
-                s_cp_sm.aborting_job = true;
-                s_cp_sm.work_complete = true;
-                s_cp_sm.powerdown_ready = true;
-                aov_cp_finish_ap_powerdown(AOV_CP_EVENT_STATE_TIMEOUT);
-            }
+            /*
+             * Do not force-close AP. Wait for AP work-complete /
+             * POWERDOWN_READY reports, then aov_cp_try_powerdown().
+             */
+            LOGE("state timeout in %s (ap_vote=%u job=%u); wait AP notify to powerdown\n",
+                 aov_cp_state_name(s_cp_sm.state),
+                 (unsigned)s_cp_sm.ap_vote_on,
+                 (unsigned)s_cp_sm.active_job);
             break;
         case AOV_CP_EVENT_AP_REPORT:
             aov_cp_handle_ap_report(&event->report);
@@ -563,6 +693,14 @@ static void aov_cp_handle_event(const aov_cp_event_t *event)
         case AOV_CP_EVENT_OTA_FINISH:
             aov_cp_set_state(AOV_CP_STATE_BOOT_INIT,
                              AOV_CP_EVENT_OTA_FINISH);
+            break;
+        case AOV_CP_EVENT_AP_POWERED_OFF:
+            if (s_cp_sm.ap_powering_down) {
+                LOGI("AP physical power-off complete, seq=%u\n",
+                     (unsigned)s_cp_sm.active_sequence);
+                aov_cp_complete_ap_powerdown(
+                    AOV_CP_EVENT_AP_POWERED_OFF);
+            }
             break;
         case AOV_CP_EVENT_LIVE_STOP:
             LOGD("live stop is handled by AP report in framework slice\n");
@@ -662,12 +800,24 @@ bk_err_t aov_cp_state_machine_init(const aov_cp_device_ops_t *ops)
         return ret;
     }
 
+    ret = bk_pm_ap_ctrl_callback_register(
+        aov_cp_ap_power_off_callback, NULL,
+        PM_AP_CTRL_CB_TYPE_POWER_OFF);
+    if (ret != BK_OK) {
+        LOGE("register AP power-off callback failed: %d\n", ret);
+        rtos_deinit_queue(&s_cp_sm.queue);
+        return ret;
+    }
+
     s_cp_sm.running = true;
     ret = rtos_create_thread(&s_cp_sm.thread, AOV_CP_TASK_PRIORITY,
                              "aov_cp_sm", aov_cp_worker,
                              AOV_CP_TASK_STACK_SIZE, NULL);
     if (ret != BK_OK) {
         s_cp_sm.running = false;
+        bk_pm_ap_ctrl_callback_unregister(
+            aov_cp_ap_power_off_callback,
+            PM_AP_CTRL_CB_TYPE_POWER_OFF);
         rtos_deinit_queue(&s_cp_sm.queue);
         return ret;
     }
@@ -685,6 +835,9 @@ bk_err_t aov_cp_state_machine_deinit(void)
     aov_cp_event_t event = {.id = AOV_CP_EVENT_STOP};
     aov_cp_state_machine_post_event(&event);
     aov_cp_cancel_timer();
+    bk_pm_ap_ctrl_callback_unregister(
+        aov_cp_ap_power_off_callback,
+        PM_AP_CTRL_CB_TYPE_POWER_OFF);
     s_cp_sm.initialized = false;
     return BK_OK;
 }

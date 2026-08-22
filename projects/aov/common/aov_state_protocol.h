@@ -8,12 +8,16 @@ extern "C" {
 #endif
 
 #define AOV_PROTOCOL_MAGIC                  (0x414F5653u) /* "AOVS" */
-#define AOV_PROTOCOL_VERSION                (2u)
+#define AOV_PROTOCOL_VERSION                (3u)
 #define AOV_GRAY_WIDTH                      (320u)
 #define AOV_GRAY_HEIGHT                     (180u)
 #define AOV_GRAY_STRIDE                     (AOV_GRAY_WIDTH)
 #define AOV_GRAY_BUFFER_SIZE                (AOV_GRAY_STRIDE * AOV_GRAY_HEIGHT)
 #define AOV_FIRST_MOTION_SAMPLE_INTERVAL_MS (1000u)
+#ifndef AOV_CONSECUTIVE_NO_MOTION_STOP_COUNT
+/* Used only after motion was seen; any new motion resets the counter. */
+#define AOV_CONSECUTIVE_NO_MOTION_STOP_COUNT (30u)
+#endif
 #define AOV_IPC_PAYLOAD_MAX                 (256u)
 #define AOV_IPC_EVENT_MAGIC                 (0xA5A6u)
 #define AOV_WIFI_SSID_MAX_LEN               (32u)
@@ -46,8 +50,8 @@ typedef enum {
     AOV_AP_STATE_BOOTING,
     AOV_AP_STATE_READY,
     AOV_AP_STATE_QR_PROVISION_CAPTURE,
-    AOV_AP_STATE_SNAPSHOT_CAPTURE,
-    AOV_AP_STATE_MOTION_DETECTING,
+    /* Value 4 is reserved for the removed SNAPSHOT_CAPTURE state. */
+    AOV_AP_STATE_MOTION_DETECTING = 5,
     AOV_AP_STATE_EVENT_ACTIVE,
     AOV_AP_STATE_LIVE_STREAMING,
     AOV_AP_STATE_STOPPING,
@@ -102,6 +106,7 @@ typedef enum {
     AOV_CP_EVENT_FACTORY_RESET,
     AOV_CP_EVENT_OTA_START,
     AOV_CP_EVENT_OTA_FINISH,
+    AOV_CP_EVENT_AP_POWERED_OFF,
     AOV_CP_EVENT_STOP,
     AOV_CP_EVENT_MAX,
 } aov_cp_event_id_t;
@@ -145,6 +150,17 @@ typedef struct {
 } aov_gray_frame_desc_t;
 
 typedef struct {
+    uint32_t composite_exposure;
+    uint32_t exposure_time_us;
+    uint32_t analog_gain;
+    uint32_t digital_gain;
+    uint32_t iso;
+    uint32_t mean_luminance;
+    uint8_t valid;
+    uint8_t reserved[3];
+} aov_ae_warm_start_t;
+
+typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t size;
@@ -154,6 +170,7 @@ typedef struct {
     uint32_t ap_state;
     uint32_t flags;
     aov_gray_frame_desc_t previous_gray;
+    aov_ae_warm_start_t previous_ae;
     uint8_t previous_gray_data[AOV_GRAY_BUFFER_SIZE];
 } aov_shared_env_t;
 
@@ -206,6 +223,8 @@ _Static_assert(sizeof(aov_ap_report_t) <= AOV_IPC_PAYLOAD_MAX,
                "aov_ap_report_t exceeds customer IPC payload");
 _Static_assert(sizeof(aov_wifi_credentials_t) <= AOV_IPC_PAYLOAD_MAX,
                "aov_wifi_credentials_t exceeds customer IPC payload");
+_Static_assert(sizeof(aov_shared_env_t) <= UINT16_MAX,
+               "aov_shared_env_t exceeds uint16_t size field");
 
 #ifdef __cplusplus
 }
