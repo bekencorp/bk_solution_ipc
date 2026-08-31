@@ -486,6 +486,28 @@ int doorbell_camera_turn_on(camera_parameters_t *parameters)
             goto err;
         }
 
+#if CONFIG_PT_MP_H264_FRAME_MODE
+        /*
+         * pt_camera_frame: the MP path runs in FRAME mode. A project-local
+         * bring-up creates a frame-mode H264 encoder and starts a zero-copy
+         * temporal-NDR bond (which takes over the MP channel), replacing the
+         * stock flexa encoder + flexa ISP->H264 bond below. Gated + default-off
+         * so every other project keeps the exact flexa path.
+         */
+        extern int pt_camera_frame_codec_bond_start(void);
+
+        info->isp_handle = app_isp_handle_get();
+        if (info->isp_handle == NULL) {
+            LOGE("%s, app_isp_handle_get failed\n", __func__);
+            goto err;
+        }
+
+        ret = pt_camera_frame_codec_bond_start();
+        if (ret != BK_OK) {
+            LOGE("%s, pt_camera_frame_codec_bond_start failed, ret = %d\n", __func__, ret);
+            goto err;
+        }
+#else
         ret = app_h264e_turn_on();
 
         if (ret != BK_OK)
@@ -519,6 +541,7 @@ int doorbell_camera_turn_on(camera_parameters_t *parameters)
             LOGE("%s, bk_flexa_isp_bond_start failed, ret = %d\n", __func__, ret);
             goto err;
         }
+#endif /* CONFIG_PT_MP_H264_FRAME_MODE */
 
 #ifdef CONFIG_MDS_SNAPSHOT
         /* Pre-allocate snapshot buffers only; open SP on capture to avoid idle ISP load. */
@@ -567,6 +590,14 @@ err:
     }
     else
     {
+#if CONFIG_PT_MP_H264_FRAME_MODE
+        {
+            extern int pt_camera_frame_codec_bond_stop(void);
+            pt_camera_frame_codec_bond_stop();
+        }
+        info->isp_handle = NULL;
+        info->encode_handle = NULL;
+#else
         if (info->h264e_bond != NULL)
         {
             bk_flexa_isp_h264e_bond_stop(info->h264e_bond);
@@ -575,6 +606,7 @@ err:
         info->isp_handle = NULL;
         info->encode_handle = NULL;
         app_h264e_turn_off();
+#endif
 #if !CONFIG_PT_TRACKING
 #ifdef CONFIG_MDS_SNAPSHOT
         (void)bk_snapshot_sw_deinit();
@@ -634,6 +666,15 @@ int doorbell_camera_turn_off(void)
     {
         gpu_pipeline_detach(info);
 
+#if CONFIG_PT_MP_H264_FRAME_MODE
+        {
+            extern int pt_camera_frame_codec_bond_stop(void);
+            pt_camera_frame_codec_bond_stop();
+        }
+        info->isp_handle = NULL;
+        info->encode_handle = NULL;
+        info->h264e_bond = NULL;
+#else
         bk_flexa_isp_h264e_bond_stop(info->h264e_bond);
 
         info->isp_handle = NULL;
@@ -647,6 +688,7 @@ int doorbell_camera_turn_off(void)
             ret = BK_FAIL;
             return ret;
         }
+#endif
 
 #ifdef CONFIG_MDS_SNAPSHOT
 #if !CONFIG_PT_TRACKING

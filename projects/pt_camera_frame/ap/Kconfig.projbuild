@@ -1,0 +1,26 @@
+menu "PT Camera Configuration"
+
+    config PT_MP_H264_FRAME_MODE
+        bool "MP path: frame-mode H264 with temporal NDR (zero-copy bond)"
+        default y
+        help
+            Run the MP (main path) ISP -> H264 pipeline in frame mode instead of
+            flexa, and insert a project-local temporal NDR (3D noise reduction)
+            bond before the encoder. The bond takes over the MP channel via
+            bk_isp_camera_channel_acquire(), pumps frames zero-copy on its own
+            thread, blends when ISO/motion gates allow, then feeds the frame
+            encoder via bk_h264_encode_set_input(). When unset the project falls
+            back to the stock flexa ISP->H264 bond.
+
+    config PT_TRACKING
+        bool "Enable pan-tilt face tracking"
+        depends on TFLITE_MICRO
+        depends on NPU
+        select TFLM_FACE_DETECTION
+        default y
+        help
+            Enable the face detection and PT motor tracking flow. When enabled,
+            the tracking task owns camera startup and doorbell camera open/close
+            skips the MIPI camera power operations.
+
+endmenu
