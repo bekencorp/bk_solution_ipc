@@ -18,6 +18,9 @@
 #endif
 #include "doorbell_ipc_msg.h"
 #include "doorbell_keepalive.h"
+#if CONFIG_PT_TRACKING
+#include "pt_face_detect.h"
+#endif
 
 int main(void)
 {
@@ -47,11 +50,21 @@ int main(void)
     camera_board.isp.mp_format = BK_PIXEL_FORMAT_NV12;
     camera_board.isp.sp_enable = false;
     camera_board.isp.sp_flexa = false;
+    camera_board.mipi.hmirror = 0;
+    camera_board.mipi.vflip = 1;
 
     bk_frame_buffer_init();
 
     /* Board config for Multimedia config */
     app_camera_board_config_set(&camera_board);
+
+#if CONFIG_PT_TRACKING
+    if (pt_face_detect_init() != BK_OK) {
+        BK_LOGE(NULL, "pt face detect init failed\r\n");
+    } else if (pt_face_detect_start() != BK_OK) {
+        BK_LOGE(NULL, "pt face detect start failed\r\n");
+    }
+#endif
 
     /* Debug config for Multimedia */
     avdk_monitor_init();
@@ -63,7 +76,7 @@ int main(void)
     bk_smart_config_init();
     doorbell_core_init();
 
-#if (CONFIG_ASR_SERVICE_WITH_MIC)
+#if (CONFIG_ASR_SERVICE_WITH_MIC) && (!CONFIG_PT_TRACKING)
     extern int doorbell_asr_turn_on(void);
     doorbell_asr_turn_on();
 #endif

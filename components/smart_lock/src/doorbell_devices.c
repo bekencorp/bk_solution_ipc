@@ -466,13 +466,17 @@ int doorbell_camera_turn_on(camera_parameters_t *parameters)
     }
     else
     {
-        ret = app_isp_mipi_camera_turn_on(app_camera_board_config_get());
-
-        if (ret != BK_OK)
+#if !CONFIG_PT_TRACKING
         {
-            LOGE("app_isp_mipi_camera_turn_on failed\n");
-            goto err;
+            ret = app_isp_mipi_camera_turn_on(app_camera_board_config_get());
+
+            if (ret != BK_OK)
+            {
+                LOGE("app_isp_mipi_camera_turn_on failed\n");
+                goto err;
+            }
         }
+#endif
 
         ret = devices_mgmt_set_display_source(DISPLAY_STREAM_ID_MIPI_CSI, NULL);
 
@@ -571,10 +575,12 @@ err:
         info->isp_handle = NULL;
         info->encode_handle = NULL;
         app_h264e_turn_off();
+#if !CONFIG_PT_TRACKING
 #ifdef CONFIG_MDS_SNAPSHOT
         (void)bk_snapshot_sw_deinit();
 #endif
         app_isp_camera_turn_off();
+#endif
     }
 
     info->video_enable = false;
@@ -643,9 +649,15 @@ int doorbell_camera_turn_off(void)
         }
 
 #ifdef CONFIG_MDS_SNAPSHOT
+#if !CONFIG_PT_TRACKING
         (void)bk_snapshot_sw_deinit();
 #endif
+#endif
+#if !CONFIG_PT_TRACKING
         ret = app_isp_camera_turn_off();
+#else
+        ret = BK_OK;
+#endif
 
     }
 

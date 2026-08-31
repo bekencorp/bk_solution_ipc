@@ -1,0 +1,14 @@
+menu "PT Camera Configuration"
+
+    config PT_TRACKING
+        bool "Enable pan-tilt face tracking"
+        depends on TFLITE_MICRO
+        depends on NPU
+        select TFLM_FACE_DETECTION
+        default y
+        help
+            Enable the face detection and PT motor tracking flow. When enabled,
+            the tracking task owns camera startup and doorbell camera open/close
+            skips the MIPI camera power operations.
+
+endmenu

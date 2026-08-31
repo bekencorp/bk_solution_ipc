@@ -1,6 +1,15 @@
-set(incs .)
+set(incs . include src)
 
-set(srcs ap_main.c)
+set(srcs
+    ap_main.c
+)
+
+if (CONFIG_PT_TRACKING)
+    list(APPEND srcs
+        src/pt_face_detect.cc
+        src/pt_motor.c
+    )
+endif()
 
 if (CONFIG_AUD_PARAM_CTRL)
     list(APPEND incs ./audio_param)
@@ -12,6 +21,8 @@ set(priv_req
     avdk_utils
     media_service
     smart_lock
+    avdk_nn_module
+    bk_tflite_micro
     bk_network_transfer
     lwip_intf_v2_1
     bk_wifi_driver
