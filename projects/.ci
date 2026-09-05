@@ -3,3 +3,4 @@ cd aov;./dbuild.sh make bk7259
 cd isp_h264_tuning;./dbuild.sh make bk7259
 cd pt_camera;./dbuild.sh make bk7259
 cd pt_camera_frame;./dbuild.sh make bk7259
+cd ptz_camera_200W;./dbuild.sh make bk7259
