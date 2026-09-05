@@ -50,6 +50,8 @@ static volatile bool s_running;
 static bool s_initialized;
 static beken_thread_t s_thread;
 static beken_semaphore_t s_exit_sem;
+static beken_semaphore_t s_wake_sem;
+static volatile pt_day_night_mode_t s_mode = PT_DAY_NIGHT_MODE_AUTO;
 
 static bk_err_t pt_dn_set_image_mode(bool night)
 {
@@ -184,59 +186,86 @@ static void pt_day_night_task(beken_thread_arg_t arg)
 	(void)arg;
 
 	while (s_running) {
-		bk_isp_camera_ctlr_handle_t camera =
-			app_isp_camera_ctlr_handle_get();
-		uint32_t luminance = 0;
-		avdk_err_t ret = BK_FAIL;
-		if (camera != NULL) {
-			ret = bk_isp_camera_ctlr_ioctl(
-					camera,
-					BK_CAM_IOCTL_GET_EXPOSURE_LUMINANCE,
-					&luminance);
-		}
+		pt_day_night_mode_t mode = s_mode;
+		uint32_t sample_ms;
 
-		if (ret == AVDK_ERR_OK) {
-			if (!s_dn.current_is_night) {
-				if (luminance < PT_DN_DAY_TO_NIGHT_LUMA) {
-					s_dn.day_count = 0;
-					if (++s_dn.night_count >=
-					    PT_DN_CONFIRM_COUNT) {
-						s_dn.current_is_night = true;
+		if (mode == PT_DAY_NIGHT_MODE_AUTO) {
+			bk_isp_camera_ctlr_handle_t camera =
+				app_isp_camera_ctlr_handle_get();
+			uint32_t luminance = 0;
+			avdk_err_t ret = BK_FAIL;
+			if (camera != NULL) {
+				ret = bk_isp_camera_ctlr_ioctl(
+						camera,
+						BK_CAM_IOCTL_GET_EXPOSURE_LUMINANCE,
+						&luminance);
+			}
+
+			if (ret == AVDK_ERR_OK) {
+				if (!s_dn.current_is_night) {
+					if (luminance < PT_DN_DAY_TO_NIGHT_LUMA) {
+						s_dn.day_count = 0;
+						if (++s_dn.night_count >=
+						    PT_DN_CONFIRM_COUNT) {
+							s_dn.current_is_night = true;
+							s_dn.state_stable = true;
+							LOGI("DAY->NIGHT luminance=%u\r\n",
+							     luminance);
+						}
+					} else {
+						s_dn.night_count = 0;
+						if (++s_dn.day_count >=
+						    PT_DN_CONFIRM_COUNT) {
+							s_dn.state_stable = true;
+						}
+					}
+				} else if (luminance > PT_DN_NIGHT_TO_DAY_LUMA) {
+					s_dn.night_count = 0;
+					if (++s_dn.day_count >= PT_DN_CONFIRM_COUNT) {
+						s_dn.current_is_night = false;
 						s_dn.state_stable = true;
-						LOGI("DAY->NIGHT luminance=%u\r\n",
+						LOGI("NIGHT->DAY luminance=%u\r\n",
 						     luminance);
 					}
 				} else {
-					s_dn.night_count = 0;
-					if (++s_dn.day_count >=
-					    PT_DN_CONFIRM_COUNT) {
-						s_dn.state_stable = true;
-					}
+					s_dn.day_count = 0;
 				}
-			} else if (luminance > PT_DN_NIGHT_TO_DAY_LUMA) {
-				s_dn.night_count = 0;
-				if (++s_dn.day_count >= PT_DN_CONFIRM_COUNT) {
-					s_dn.current_is_night = false;
-					s_dn.state_stable = true;
-					LOGI("NIGHT->DAY luminance=%u\r\n",
-					     luminance);
+
+				pt_dn_service_lockout();
+				ret = pt_dn_apply_mode(s_dn.current_is_night);
+				if (ret != BK_OK && ret != BK_ERR_BUSY) {
+					LOGW("apply %s mode failed: %d\r\n",
+					     s_dn.current_is_night ? "night" : "day",
+					     ret);
 				}
-			} else {
-				s_dn.day_count = 0;
 			}
 
-			pt_dn_service_lockout();
-			ret = pt_dn_apply_mode(s_dn.current_is_night);
+			sample_ms = s_dn.state_stable ?
+					PT_DN_STABLE_SAMPLE_MS :
+					PT_DN_FAST_SAMPLE_MS;
+		} else {
+			bool night = (mode == PT_DAY_NIGHT_MODE_MANUAL_NIGHT);
+			bk_err_t ret;
+
+			/* Manual switching is user-driven: clear any chatter
+			 * lockout so the user can toggle IR/color freely. */
+			pt_dn_reset_lockout();
+			s_dn.current_is_night = night;
+			ret = pt_dn_apply_mode(night);
 			if (ret != BK_OK && ret != BK_ERR_BUSY) {
-				LOGW("apply %s mode failed: %d\r\n",
-				     s_dn.current_is_night ? "night" : "day",
+				LOGW("apply manual %s mode failed: %d\r\n",
+				     night ? "night-infrared" : "day-color",
 				     ret);
 			}
+			sample_ms = PT_DN_STABLE_SAMPLE_MS;
 		}
 
-		rtos_delay_milliseconds(s_dn.state_stable ?
-					PT_DN_STABLE_SAMPLE_MS :
-					PT_DN_FAST_SAMPLE_MS);
+		/* Sleep, but wake immediately on a mode change request. */
+		if (s_wake_sem != NULL) {
+			(void)rtos_get_semaphore(&s_wake_sem, sample_ms);
+		} else {
+			rtos_delay_milliseconds(sample_ms);
+		}
 	}
 
 	s_thread = NULL;
@@ -244,6 +273,37 @@ static void pt_day_night_task(beken_thread_arg_t arg)
 		rtos_set_semaphore(&s_exit_sem);
 	}
 	rtos_delete_thread(NULL);
+}
+
+pt_day_night_mode_t pt_day_night_mode_get(void)
+{
+	return s_mode;
+}
+
+bool pt_day_night_is_night(void)
+{
+	return s_dn.applied_mode == 1;
+}
+
+bk_err_t pt_day_night_mode_set(pt_day_night_mode_t mode)
+{
+	if (mode != PT_DAY_NIGHT_MODE_AUTO &&
+	    mode != PT_DAY_NIGHT_MODE_MANUAL_DAY &&
+	    mode != PT_DAY_NIGHT_MODE_MANUAL_NIGHT) {
+		return BK_ERR_PARAM;
+	}
+
+	s_mode = mode;
+	/* Re-enter fast sampling so an auto re-evaluation reacts quickly. */
+	s_dn.state_stable = false;
+	s_dn.day_count = 0;
+	s_dn.night_count = 0;
+
+	/* Nudge the worker so the new mode is applied without waiting a cycle. */
+	if (s_wake_sem != NULL) {
+		rtos_set_semaphore(&s_wake_sem);
+	}
+	return BK_OK;
 }
 
 bk_err_t pt_day_night_start(void)
@@ -257,6 +317,7 @@ bk_err_t pt_day_night_start(void)
 	os_memset(&s_dn, 0, sizeof(s_dn));
 	s_dn.applied_mode = -1;
 	s_dn.applied_image = -1;
+	s_mode = PT_DAY_NIGHT_MODE_AUTO;
 
 	ret = pt_ir_led_init();
 	if (ret != BK_OK) {
@@ -283,6 +344,13 @@ bk_err_t pt_day_night_start(void)
 		s_initialized = false;
 		return ret;
 	}
+	ret = rtos_init_semaphore(&s_wake_sem, 1);
+	if (ret != BK_OK) {
+		rtos_deinit_semaphore(&s_exit_sem);
+		s_exit_sem = NULL;
+		s_initialized = false;
+		return ret;
+	}
 	s_running = true;
 	ret = rtos_create_thread(&s_thread, BEKEN_DEFAULT_WORKER_PRIORITY,
 				 "pt_day_night",
@@ -292,6 +360,8 @@ bk_err_t pt_day_night_start(void)
 		s_running = false;
 		rtos_deinit_semaphore(&s_exit_sem);
 		s_exit_sem = NULL;
+		rtos_deinit_semaphore(&s_wake_sem);
+		s_wake_sem = NULL;
 		s_initialized = false;
 		return ret;
 	}
@@ -308,6 +378,10 @@ void pt_day_night_stop(void)
 
 	if (s_thread != NULL) {
 		s_running = false;
+		/* Wake the worker if it is parked on the sample delay. */
+		if (s_wake_sem != NULL) {
+			rtos_set_semaphore(&s_wake_sem);
+		}
 		if (rtos_get_semaphore(&s_exit_sem, PT_DN_STOP_WAIT_MS) != BK_OK) {
 			LOGW("thread stop timeout\r\n");
 		}
@@ -315,6 +389,10 @@ void pt_day_night_stop(void)
 	if (s_exit_sem != NULL) {
 		rtos_deinit_semaphore(&s_exit_sem);
 		s_exit_sem = NULL;
+	}
+	if (s_wake_sem != NULL) {
+		rtos_deinit_semaphore(&s_wake_sem);
+		s_wake_sem = NULL;
 	}
 
 	pt_dn_reset_lockout();

@@ -30,6 +30,9 @@
 #if CONFIG_H264E_STREAM_SESSION
 #include "h264e_stream_session.h"
 #endif
+#if CONFIG_NTWK_H264_DROP_POLICY
+#include "h264_backpressure_drop.h"
+#endif
 
 #define TAG "pt-frame-bringup"
 
@@ -38,15 +41,49 @@
 #define LOGE(...) BK_LOGE(TAG, ##__VA_ARGS__)
 
 /*
- * Reuse the stock output-buffer callbacks from multimedia_device_service's
- * app_codec.c (non-static globals). They wrap the encoded-data manager exactly
- * as the flexa path does, so the network/session plumbing is unchanged.
+ * Reuse the stock output-buffer request callback from multimedia_device_service's
+ * app_codec.c (non-static global). It wraps the encoded-data manager exactly as
+ * the flexa path does, so the network/session plumbing is unchanged.
+ *
+ * The completion callback, however, is project-local: the stock
+ * encoder_buffer_complete() re-targets the drop-policy force-IDR at
+ * app_codec_enc_handler, which stays NULL in the frame path (this project owns a
+ * private encoder s_frame_enc instead). Routing the force-IDR to app_codec's NULL
+ * handle silently swallows it, so after a network-congestion frame drop the
+ * decoder never gets an IDR to resync and moving areas stay mosaicked until the
+ * next natural GOP boundary. We mirror the stock plumbing but drive force-IDR on
+ * s_frame_enc so recovery actually happens.
  */
 extern void *encoder_buffer_request(uint32_t buffer_len, void *args);
-extern uint32_t encoder_buffer_complete(bk_h264_encode_outbuf_info_t *info);
 
 static bk_h264_encode_ctlr_handle_t s_frame_enc = NULL;
 static void *s_ndr_bond = NULL;
+
+static uint32_t pt_frame_encoder_buffer_complete(bk_h264_encode_outbuf_info_t *info)
+{
+	if (info == NULL || info->outbuf == NULL) {
+		return BK_FAIL;
+	}
+
+	uint32_t frame_size = ((sizeof(frame_buffer_t) + 63) >> 6) << 6;
+	frame_buffer_t *buffer = (frame_buffer_t *)((uint8_t *)info->outbuf - frame_size);
+	if (info->status == BK_OK) {
+		buffer->length = info->length;
+		buffer->h264_type = info->type;
+		buffer->fmt = PIXEL_FMT_H264;
+		buffer->sequence = info->sequence;
+		bk_encoded_data_complete_request((uint8_t *)buffer);
+#if CONFIG_NTWK_H264_DROP_POLICY
+		if (ntwk_h264_backpressure_drop_consume_force_idr() && s_frame_enc != NULL) {
+			bk_h264_encode_force_idr(s_frame_enc);
+		}
+#endif
+	} else {
+		bk_encoded_data_free_request((uint8_t *)buffer);
+	}
+
+	return BK_OK;
+}
 
 static const char *pt_frame_ndr_mode_name(pt_frame_ndr_mode_t mode)
 {
@@ -119,9 +156,60 @@ static void cli_pt_dnr_cmd(char *pcWriteBuffer, int xWriteBufferLen,
 	pt_frame_ndr_print_status();
 }
 
+static const char *pt_day_night_mode_name(pt_day_night_mode_t mode)
+{
+	switch (mode) {
+	case PT_DAY_NIGHT_MODE_AUTO:
+		return "auto";
+	case PT_DAY_NIGHT_MODE_MANUAL_DAY:
+		return "manual-color";
+	case PT_DAY_NIGHT_MODE_MANUAL_NIGHT:
+		return "manual-ir";
+	default:
+		return "unknown";
+	}
+}
+
+static void pt_ir_print_status(void)
+{
+	LOGI("IR mode=%s optics=%s\r\n",
+	     pt_day_night_mode_name(pt_day_night_mode_get()),
+	     pt_day_night_is_night() ? "night-infrared" : "day-color");
+}
+
+/*
+ * pt_ir: control the infrared (night) vs full-color (day) optics.
+ *   auto  - luminance-driven strategy: day full-color, night infrared.
+ *   color - manually force full-color (day) mode.
+ *   ir    - manually force infrared (night) mode.
+ *   status- print the current mode and applied optical state.
+ */
+static void cli_pt_ir_cmd(char *pcWriteBuffer, int xWriteBufferLen,
+			  int argc, char **argv)
+{
+	(void)pcWriteBuffer;
+	(void)xWriteBufferLen;
+
+	if (argc == 2 && os_strcmp(argv[1], "auto") == 0) {
+		pt_day_night_mode_set(PT_DAY_NIGHT_MODE_AUTO);
+	} else if (argc == 2 && (os_strcmp(argv[1], "color") == 0 ||
+				 os_strcmp(argv[1], "day") == 0)) {
+		pt_day_night_mode_set(PT_DAY_NIGHT_MODE_MANUAL_DAY);
+	} else if (argc == 2 && (os_strcmp(argv[1], "ir") == 0 ||
+				 os_strcmp(argv[1], "night") == 0)) {
+		pt_day_night_mode_set(PT_DAY_NIGHT_MODE_MANUAL_NIGHT);
+	} else if (!(argc == 2 && os_strcmp(argv[1], "status") == 0)) {
+		LOGI("usage: pt_ir <auto|color|ir|status>\r\n");
+		return;
+	}
+
+	pt_ir_print_status();
+}
+
 static const struct cli_command s_pt_camera_frame_commands[] = {
 	{"pt_dnr", "pt_dnr <auto|on|off|status|alpha|iso|intra>",
 	 cli_pt_dnr_cmd},
+	{"pt_ir", "pt_ir <auto|color|ir|status>", cli_pt_ir_cmd},
 };
 
 int pt_camera_frame_cli_init(void)
@@ -298,7 +386,7 @@ int pt_camera_frame_codec_bond_start(void)
 		.input_size = width * height * 3U / 2U,
 		.outbuf_malloc = encoder_buffer_request,
 		.outbuf_malloc_args = NULL,
-		.outbuf_complete = encoder_buffer_complete,
+		.outbuf_complete = pt_frame_encoder_buffer_complete,
 		.outbuf_complete_args = NULL,
 	};
 
