@@ -65,10 +65,10 @@ void cli_avdk_mds_isp_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, ch
 
     LOGI("%s, %d, argc=%d\n", __func__, __LINE__, argc);
     
-    // Parse command from argv[1]: "isp_dump", "luminance", "cproc", "open", or "close"
+    // Parse command from argv[1]: "isp_dump", "luminance", "cproc", "wb", "exp", "open", or "close"
     if (argc < 2 || argv[1] == NULL)
     {
-        LOGE("Usage: isp [isp_dump|luminance|cproc|open|close] ...\n");
+        LOGE("Usage: isp [isp_dump|luminance|cproc|wb|exp|open|close] ...\n");
         return;
     }
 
@@ -189,6 +189,177 @@ void cli_avdk_mds_isp_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, ch
         }
 
         LOGE("Usage: isp cproc sat <0|default> | isp cproc get\n");
+        return;
+    }
+
+    if (os_strcmp(argv[1], "wb") == 0)
+    {
+        /* isp wb get
+         * isp wb auto
+         * isp wb set <enable> <0=auto|1=manual> <rGain> <grGain> <gbGain> <bGain>
+         * Gains are fixed point, 0x100 = 1.0x, valid range [0x100, 0x3FF]. */
+        bk_isp_camera_ctlr_handle_t camera = app_isp_camera_ctlr_handle_get();
+        if (camera == NULL)
+        {
+            bk_printf("[RESULT][FAIL] wb camera_not_ready\r\n");
+            return;
+        }
+
+        if (argc < 3 || argv[2] == NULL)
+        {
+            LOGE("Usage: isp wb get | isp wb auto | isp wb set <enable> <type> <r> <gr> <gb> <b>\n");
+            return;
+        }
+
+        bk_isp_camera_wb_attr_t wb = {0};
+
+        /* Always read first so the fields this command does not touch keep
+         * their current value. */
+        ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_GET_WB, &wb);
+        if (ret != AVDK_ERR_OK)
+        {
+            bk_printf("[RESULT][FAIL] wb get ret=%d\r\n", ret);
+            return;
+        }
+
+        if (os_strcmp(argv[2], "get") != 0)
+        {
+            if (os_strcmp(argv[2], "auto") == 0)
+            {
+                wb.op_type = BK_ISP_OP_TYPE_AUTO;
+            }
+            else if (os_strcmp(argv[2], "set") == 0)
+            {
+                if (argc < 9)
+                {
+                    LOGE("Usage: isp wb set <enable> <0=auto|1=manual> <r> <gr> <gb> <b>\n");
+                    return;
+                }
+                wb.enable = (uint8_t)os_strtoul(argv[3], NULL, 0);
+                wb.op_type = (uint32_t)os_strtoul(argv[4], NULL, 0);
+                wb.manual_gain.r_gain = (uint16_t)os_strtoul(argv[5], NULL, 0);
+                wb.manual_gain.gr_gain = (uint16_t)os_strtoul(argv[6], NULL, 0);
+                wb.manual_gain.gb_gain = (uint16_t)os_strtoul(argv[7], NULL, 0);
+                wb.manual_gain.b_gain = (uint16_t)os_strtoul(argv[8], NULL, 0);
+            }
+            else
+            {
+                LOGE("Usage: isp wb get | isp wb auto | isp wb set <enable> <type> <r> <gr> <gb> <b>\n");
+                return;
+            }
+
+            ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_SET_WB, &wb);
+            if (ret != AVDK_ERR_OK)
+            {
+                bk_printf("[RESULT][FAIL] wb set ret=%d\r\n", ret);
+                return;
+            }
+
+            /* Out-of-range gains are clamped by the ISP firmware instead of
+             * being rejected, so report what was actually applied. */
+            ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_GET_WB, &wb);
+            if (ret != AVDK_ERR_OK)
+            {
+                bk_printf("[RESULT][FAIL] wb readback ret=%d\r\n", ret);
+                return;
+            }
+        }
+
+        bk_printf("[RESULT][PASS] wb enable=%u type=%u r=0x%x gr=0x%x gb=0x%x b=0x%x\r\n",
+                  wb.enable, wb.op_type,
+                  wb.manual_gain.r_gain, wb.manual_gain.gr_gain,
+                  wb.manual_gain.gb_gain, wb.manual_gain.b_gain);
+        return;
+    }
+
+    if (os_strcmp(argv[1], "exp") == 0)
+    {
+        /* isp exp get   - configured mode and manual values
+         * isp exp info  - AE result actually in effect, use as a manual baseline
+         * isp exp auto
+         * isp exp set <0=auto|1=manual> <intTime_us> <again> <dgain>
+         * Gain units are sensor specific, so run "isp exp info" first and
+         * scale relative to the values it reports. */
+        bk_isp_camera_ctlr_handle_t camera = app_isp_camera_ctlr_handle_get();
+        if (camera == NULL)
+        {
+            bk_printf("[RESULT][FAIL] exp camera_not_ready\r\n");
+            return;
+        }
+
+        if (argc < 3 || argv[2] == NULL)
+        {
+            LOGE("Usage: isp exp get | isp exp info | isp exp auto | isp exp set <type> <intTime> <again> <dgain>\n");
+            return;
+        }
+
+        if (os_strcmp(argv[2], "info") == 0)
+        {
+            bk_isp_camera_exposure_info_t info = {0};
+            ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_QUERY_EXPOSURE_INFO, &info);
+            if (ret != AVDK_ERR_OK)
+            {
+                bk_printf("[RESULT][FAIL] exp info ret=%d\r\n", ret);
+                return;
+            }
+            bk_printf("[RESULT][PASS] exp info intTime=%u again=%u dgain=%u iso=%u lum=%u\r\n",
+                      info.exposure_time_us, info.analog_gain, info.digital_gain,
+                      info.iso, info.mean_luminance);
+            return;
+        }
+
+        bk_isp_camera_exposure_attr_t exp = {0};
+
+        ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_GET_EXPOSURE, &exp);
+        if (ret != AVDK_ERR_OK)
+        {
+            bk_printf("[RESULT][FAIL] exp get ret=%d\r\n", ret);
+            return;
+        }
+
+        if (os_strcmp(argv[2], "get") != 0)
+        {
+            if (os_strcmp(argv[2], "auto") == 0)
+            {
+                exp.op_type = BK_ISP_OP_TYPE_AUTO;
+            }
+            else if (os_strcmp(argv[2], "set") == 0)
+            {
+                if (argc < 7)
+                {
+                    LOGE("Usage: isp exp set <0=auto|1=manual> <intTime_us> <again> <dgain>\n");
+                    return;
+                }
+                exp.op_type = (uint32_t)os_strtoul(argv[3], NULL, 0);
+                exp.int_time = (uint32_t)os_strtoul(argv[4], NULL, 0);
+                exp.again = (uint32_t)os_strtoul(argv[5], NULL, 0);
+                exp.dgain = (uint32_t)os_strtoul(argv[6], NULL, 0);
+            }
+            else
+            {
+                LOGE("Usage: isp exp get | isp exp info | isp exp auto | isp exp set <type> <intTime> <again> <dgain>\n");
+                return;
+            }
+
+            ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_SET_EXPOSURE, &exp);
+            if (ret != AVDK_ERR_OK)
+            {
+                bk_printf("[RESULT][FAIL] exp set ret=%d\r\n", ret);
+                return;
+            }
+
+            /* Out-of-range values are clamped by the ISP firmware instead of
+             * being rejected, so report what was actually applied. */
+            ret = bk_isp_camera_ctlr_ioctl(camera, BK_CAM_IOCTL_GET_EXPOSURE, &exp);
+            if (ret != AVDK_ERR_OK)
+            {
+                bk_printf("[RESULT][FAIL] exp readback ret=%d\r\n", ret);
+                return;
+            }
+        }
+
+        bk_printf("[RESULT][PASS] exp type=%u intTime=%u again=%u dgain=%u\r\n",
+                  exp.op_type, exp.int_time, exp.again, exp.dgain);
         return;
     }
 
@@ -1471,7 +1642,7 @@ out:
 
 static const struct cli_command s_devices_cli_commands[] =
 {
-    {"isp", "isp [isp_dump|luminance|cproc|open|close] ...; cproc: sat <0|default> | get", cli_avdk_mds_isp_cmd},
+    {"isp", "isp [isp_dump|luminance|cproc|wb|exp|open|close] ...; cproc: sat <0|default> | get; wb: get | auto | set <enable> <type> <r> <gr> <gb> <b>; exp: get | info | auto | set <type> <intTime> <again> <dgain>", cli_avdk_mds_isp_cmd},
     {"display", "display...", cli_avdk_mds_display_cmd},
     {"joint_test", "joint_test open mipi [720p|1080p] [fps] [h264e] | open uvc [h264e] | test | close uvc|mipi", cli_avdk_mds_joint_test_cmd},
     {"uvc", "uvc...", cli_avdk_mds_uvc_cmd},
